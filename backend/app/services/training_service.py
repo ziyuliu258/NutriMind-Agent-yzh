@@ -21,7 +21,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.config.settings import settings
-from app.database.session import SessionLocal
+from app.database.session import get_session_local
 from app.entity.db_models import TrainingTask
 from app.entity.schemas import TrainingTaskCreate
 
@@ -157,7 +157,7 @@ class TrainingService:
         db: Optional[Session] = None
         try:
             # 独立会话
-            db = SessionLocal()
+            db = get_session_local()()
             task = db.query(TrainingTask).filter(
                 TrainingTask.task_uuid == task_uuid
             ).first()
@@ -181,7 +181,8 @@ class TrainingService:
             # 实例化 YOLO26 并执行训练
             from ultralytics import YOLO
 
-            model_path = str(base_model_path) if base_model_path.exists() else base_model
+            model_path = str(
+                base_model_path) if base_model_path.exists() else base_model
 
             # 自动 batch size 降级列表
             batch_sizes = [task.batch_size] + [
@@ -238,8 +239,42 @@ class TrainingService:
                     f"最后错误: {last_error}"
                 )
 
-            # 提取关键指标
-            metrics = _extract_training_metrics(train_results)
+            # ultralytics 训练结果中包含多种指标，优先取最佳 epoch 的结果
+            metrics = {
+                "mAP50": (
+                    float(train_results.results_dict.get("metrics/mAP50(B)", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+                "mAP50-95": (
+                    float(train_results.results_dict.get(
+                        "metrics/mAP50-95(B)", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+                "precision": (
+                    float(train_results.results_dict.get(
+                        "metrics/precision(B)", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+                "recall": (
+                    float(train_results.results_dict.get(
+                        "metrics/recall(B)", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+                "box_loss": (
+                    float(train_results.results_dict.get("train/box_loss", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+                "cls_loss": (
+                    float(train_results.results_dict.get("train/cls_loss", 0))
+                    if hasattr(train_results, "results_dict")
+                    else None
+                ),
+            }
 
             # 确定输出模型路径
             output_model_path = str(
