@@ -139,7 +139,7 @@ class SceneResponse(BaseModel):
 class TrainingTaskCreate(BaseModel):
     """创建训练任务请求"""
     scene_id: Optional[int] = Field(default=None, description="关联检测场景 ID")
-    model_name: str = Field(default="yolo26n", description="基础模型名称")
+    model_name: str = Field(default="yolo11s", description="基础模型名称")
     data_yaml: str = Field(..., description="数据集 data.yaml 文件路径")
     epochs: int = Field(default=100, gt=0, le=1000, description="训练轮数")
     img_size: int = Field(default=640, ge=320, le=1920, description="输入图像尺寸")

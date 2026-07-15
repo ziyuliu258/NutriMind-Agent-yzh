@@ -1,11 +1,11 @@
 """
-训练服务模块 — YOLO26 模型微调任务管理与后台训练执行。
+训练服务模块 — YOLOv11 模型微调任务管理与后台训练执行。
 
 职责：
 - 训练任务的创建、启动、暂停（CRUD 生命周期管理）
 - 后台异步训练执行（asyncio.create_task 拉起，不阻塞请求响应）
 - 训练指标（mAP、Precision、Recall、Loss）的记录与状态回写
-- 借助 YOLO26 特有的 MuSGD 优化器保障训练稳定性
+- 借助 YOLOv11 特有的 MuSGD 优化器保障训练稳定性
 
 注意：
 - 训练是 CPU/GPU 密集型操作，必须在 asyncio.to_thread() 中执行
@@ -27,7 +27,7 @@ from app.entity.schemas import TrainingTaskCreate
 
 
 class TrainingService:
-    """YOLO26 训练服务 — 管理模型微调任务。"""
+    """YOLOv11 训练服务 — 管理模型微调任务。"""
 
     # ------------------------------------------------------------------
     # 任务生命周期管理
@@ -141,7 +141,7 @@ class TrainingService:
     # ------------------------------------------------------------------
 
     async def _run_training(self, task_uuid: str) -> None:
-        """后台执行 YOLO26 模型训练（内部方法）。
+        """后台执行 YOLOv11 模型训练（内部方法）。
 
         针对 AutoDL 环境 (RTX 3080 Ti / 12GB VRAM / 90GB RAM) 深度优化：
         1. 使用独立的数据库会话（避免长事务）
@@ -178,7 +178,7 @@ class TrainingService:
             base_model = f"{task.model_name}.pt"
             base_model_path = settings.MODELS_DIR / base_model
 
-            # 实例化 YOLO26 并执行训练
+            # 实例化 YOLOv11 并执行训练
             from ultralytics import YOLO
 
             model_path = str(
@@ -290,7 +290,7 @@ class TrainingService:
                 if src_best.exists():
                     shutil.copy2(str(src_best), output_model_path)
                     # 同时复制一份为通用名（方便检测服务直接使用）
-                    generic_path = settings.MODELS_DIR / "yolo26_food_best.pt"
+                    generic_path = settings.MODELS_DIR / "yolo11_food_best.pt"
                     shutil.copy2(str(src_best), str(generic_path))
 
             # 更新任务状态 → completed
