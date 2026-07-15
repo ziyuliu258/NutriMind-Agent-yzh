@@ -143,11 +143,13 @@ class TrainingService:
     async def _run_training(self, task_uuid: str) -> None:
         """后台执行 YOLO26 模型训练（内部方法）。
 
-        设计要点：
-        1. 使用独立的数据库会话（避免长事务持有主请求的 session）
+        针对 AutoDL 环境 (RTX 3080 Ti / 12GB VRAM / 90GB RAM) 深度优化：
+        1. 使用独立的数据库会话（避免长事务）
         2. YOLO.train() 通过 asyncio.to_thread 放入线程池
-        3. 完成/失败后更新数据库状态和指标
-        4. YOLO26 使用 MuSGD 优化器，训练过程中自动保障稳定性
+        3. 缓存全量图片到 RAM（利用 90GB 大内存）
+        4. 自动混合精度 AMP 节省显存
+        5. OOM 时自动降级 batch size 重试
+        6. 训练结束后自动将 best.pt 复制到 data/models/
 
         Args:
             task_uuid: 要执行训练的任务 UUID
@@ -177,67 +179,74 @@ class TrainingService:
             base_model_path = settings.MODELS_DIR / base_model
 
             # 实例化 YOLO26 并执行训练
-            # —— 全部通过 asyncio.to_thread 放入线程池，不阻塞事件循环
             from ultralytics import YOLO
 
             model_path = str(base_model_path) if base_model_path.exists() else base_model
 
-            def _train_sync() -> dict:
-                """同步训练函数，在线程池中执行。"""
-                model = YOLO(model_path)
-                results = model.train(
-                    data=str(data_yaml_path),
-                    epochs=task.epochs,
-                    imgsz=task.img_size,
-                    batch=task.batch_size,
-                    verbose=True,
-                )
-                return results
+            # 自动 batch size 降级列表
+            batch_sizes = [task.batch_size] + [
+                b for b in [32, 24, 16, 12, 8, 4, 2] if b < task.batch_size
+            ]
 
-            train_results = await asyncio.to_thread(_train_sync)
+            train_results = None
+            last_error = None
+
+            for bs in batch_sizes:
+                try:
+                    def _train_sync() -> dict:
+                        """同步训练函数，在线程池中执行。"""
+                        model = YOLO(model_path)
+                        results = model.train(
+                            data=str(data_yaml_path),
+                            epochs=task.epochs,
+                            imgsz=task.img_size,
+                            batch=bs,
+                            workers=8,           # 12 核 CPU 用 8 线程加载数据
+                            patience=10,         # 10 轮无提升自动早停
+                            cache="ram",         # 90GB 内存全量缓存图片
+                            amp=True,            # 自动混合精度（省显存+加速）
+                            device=0,            # GPU 0
+                            exist_ok=True,
+                            pretrained=True,
+                            verbose=True,
+                            # 轻量数据增强（密集检测友好）
+                            hsv_h=0.015,
+                            hsv_s=0.7,
+                            hsv_v=0.4,
+                            degrees=5.0,
+                            translate=0.1,
+                            scale=0.3,
+                            mosaic=0.5,
+                            mixup=0.1,
+                        )
+                        return results
+
+                    train_results = await asyncio.to_thread(_train_sync)
+                    break  # 训练成功，退出重试循环
+
+                except RuntimeError as e:
+                    last_error = e
+                    error_msg = str(e)
+                    if "out of memory" in error_msg.lower() or "OOM" in error_msg:
+                        if bs > batch_sizes[-1]:
+                            continue  # 降级重试
+                    raise  # 非 OOM 错误，直接抛出
+
+            if train_results is None:
+                raise RuntimeError(
+                    f"训练失败：所有 batch size ({batch_sizes}) 均 OOM。"
+                    f"最后错误: {last_error}"
+                )
 
             # 提取关键指标
-            # ultralytics 训练结果中包含多种指标，优先取最佳 epoch 的结果
-            metrics = {
-                "mAP50": (
-                    float(train_results.results_dict.get("metrics/mAP50(B)", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-                "mAP50-95": (
-                    float(train_results.results_dict.get("metrics/mAP50-95(B)", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-                "precision": (
-                    float(train_results.results_dict.get("metrics/precision(B)", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-                "recall": (
-                    float(train_results.results_dict.get("metrics/recall(B)", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-                "box_loss": (
-                    float(train_results.results_dict.get("train/box_loss", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-                "cls_loss": (
-                    float(train_results.results_dict.get("train/cls_loss", 0))
-                    if hasattr(train_results, "results_dict")
-                    else None
-                ),
-            }
+            metrics = _extract_training_metrics(train_results)
 
             # 确定输出模型路径
-            # ultralytics 默认将 best.pt 保存在 runs/detect/train*/weights/best.pt
             output_model_path = str(
                 settings.MODELS_DIR / f"{task.task_uuid}_best.pt"
             )
 
-            # 尝试从训练输出目录复制 best.pt
+            # 从训练输出目录复制 best.pt
             import shutil
 
             save_dir = getattr(train_results, "save_dir", None)
@@ -245,17 +254,20 @@ class TrainingService:
                 src_best = Path(save_dir) / "weights" / "best.pt"
                 if src_best.exists():
                     shutil.copy2(str(src_best), output_model_path)
+                    # 同时复制一份为通用名（方便检测服务直接使用）
+                    generic_path = settings.MODELS_DIR / "yolo26_food_best.pt"
+                    shutil.copy2(str(src_best), str(generic_path))
 
             # 更新任务状态 → completed
             task.status = "completed"
             task.metrics = metrics
+            task.batch_size = batch_sizes[0] if train_results else task.batch_size
             task.progress = 100.0
             task.output_model_path = output_model_path
             task.completed_at = datetime.now()
             db.commit()
 
         except Exception as exc:
-            # 训练失败 — 记录错误
             if db is not None:
                 task = db.query(TrainingTask).filter(
                     TrainingTask.task_uuid == task_uuid
@@ -354,6 +366,27 @@ class TrainingService:
             await detection_service.unload_model(str(model_path))
             return True
         return False
+
+
+def _extract_training_metrics(train_results) -> dict:
+    """从 ultralytics 训练结果中提取关键指标。
+
+    Args:
+        train_results: YOLO.train() 的返回结果
+
+    Returns:
+        包含 mAP、Precision、Recall、Loss 的指标字典
+    """
+    metrics = {}
+    if hasattr(train_results, "results_dict"):
+        rd = train_results.results_dict
+        metrics["mAP50"] = float(rd.get("metrics/mAP50(B)", 0))
+        metrics["mAP50-95"] = float(rd.get("metrics/mAP50-95(B)", 0))
+        metrics["precision"] = float(rd.get("metrics/precision(B)", 0))
+        metrics["recall"] = float(rd.get("metrics/recall(B)", 0))
+        metrics["box_loss"] = float(rd.get("train/box_loss", 0))
+        metrics["cls_loss"] = float(rd.get("train/cls_loss", 0))
+    return metrics
 
 
 # 模块级单例
