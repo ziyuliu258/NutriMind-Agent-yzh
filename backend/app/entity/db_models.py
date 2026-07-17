@@ -181,3 +181,57 @@ class FoodNutrition(Base):
 
     def __repr__(self):
         return f"<FoodNutrition(name={self.food_name_cn}, calories={self.calories_per_100g}kcal/100g)>"
+
+
+# ============================================================
+# 用户身体资料与目标
+# ============================================================
+
+class BodyProfile(Base):
+    """用户身体资料表"""
+    __tablename__ = "body_profiles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True,
+                     nullable=False, comment="用户 ID")
+    current_weight_kg = Column(Float, nullable=True, comment="当前体重 kg")
+    height_cm = Column(Float, nullable=True, comment="身高 cm")
+    birth_date = Column(DateTime, nullable=True, comment="出生日期")
+    sex_for_calculation = Column(
+        String(20), nullable=True,
+        comment="性别用于公式计算: male/female/unspecified"
+    )
+    activity_level = Column(
+        String(20), nullable=True,
+        comment="活动水平: sedentary/light/moderate/high/very_high"
+    )
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now,
+                        onupdate=datetime.now, comment="更新时间")
+
+    def __repr__(self):
+        return f"<BodyProfile(user_id={self.user_id}, weight={self.current_weight_kg}kg)>"
+
+
+class GoalProfile(Base):
+    """用户目标表"""
+    __tablename__ = "goal_profiles"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True,
+                     nullable=False, comment="用户 ID")
+    mode = Column(
+        String(20), nullable=True,
+        comment="目标模式: cut/muscle/maintain"
+    )
+    target_weight_kg = Column(Float, nullable=True, comment="目标体重 kg")
+    daily_calories_kcal = Column(Integer, nullable=True, comment="每日热量目标 kcal")
+    protein_target_g = Column(Integer, nullable=True, comment="每日蛋白质目标 g")
+    training_days_per_week = Column(Integer, nullable=True, comment="每周训练天数 1-7")
+    started_at = Column(DateTime, nullable=True, comment="目标开始日期")
+    created_at = Column(DateTime, default=datetime.now, comment="创建时间")
+    updated_at = Column(DateTime, default=datetime.now,
+                        onupdate=datetime.now, comment="更新时间")
+
+    def __repr__(self):
+        return f"<GoalProfile(user_id={self.user_id}, mode={self.mode})>"

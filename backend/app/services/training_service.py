@@ -276,6 +276,30 @@ class TrainingService:
                 ),
             }
 
+            # 读取 per-epoch 指标（results.csv）用于前端折线图
+            per_epoch = []
+            if save_dir:
+                csv_path = Path(save_dir) / "results.csv"
+                if csv_path.exists():
+                    import csv
+                    with open(csv_path) as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            per_epoch.append({
+                                "epoch": int(float(row.get("epoch", 0))),
+                                "train_box_loss": float(row.get("train/box_loss", 0)),
+                                "train_cls_loss": float(row.get("train/cls_loss", 0)),
+                                "train_dfl_loss": float(row.get("train/dfl_loss", 0)),
+                                "val_box_loss": float(row.get("val/box_loss", 0)),
+                                "val_cls_loss": float(row.get("val/cls_loss", 0)),
+                                "val_dfl_loss": float(row.get("val/dfl_loss", 0)),
+                                "precision": float(row.get("metrics/precision(B)", 0)),
+                                "recall": float(row.get("metrics/recall(B)", 0)),
+                                "mAP50": float(row.get("metrics/mAP50(B)", 0)),
+                                "mAP50_95": float(row.get("metrics/mAP50-95(B)", 0)),
+                            })
+            metrics["per_epoch"] = per_epoch
+
             # 确定输出模型路径
             output_model_path = str(
                 settings.MODELS_DIR / f"{task.task_uuid}_best.pt"
@@ -401,6 +425,34 @@ class TrainingService:
             await detection_service.unload_model(str(model_path))
             return True
         return False
+
+
+    async def get_training_metrics(
+        self, db: Session, task_uuid: str
+    ) -> Optional[dict]:
+        """获取训练任务的 per-epoch 折线图数据。
+
+        返回格式:
+            {
+                "task_uuid": "...",
+                "model_name": "yolo11s",
+                "epochs": [{epoch, train_box_loss, ...}, ...],
+                "final_metrics": {...}
+            }
+        """
+        task = await self.get_task_by_uuid(db, task_uuid)
+        if not task or not task.metrics:
+            return None
+
+        metrics = task.metrics if isinstance(task.metrics, dict) else {}
+        return {
+            "task_uuid": task.task_uuid,
+            "model_name": task.model_name,
+            "epochs": metrics.get("per_epoch", []),
+            "final_metrics": {
+                k: v for k, v in metrics.items() if k != "per_epoch"
+            },
+        }
 
 
 def _extract_training_metrics(train_results) -> dict:

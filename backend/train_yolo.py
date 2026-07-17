@@ -41,7 +41,7 @@ from typing import Optional
 class Config:
     """训练超参数默认值。"""
     MODEL_NAME = "yolo11s"              # YOLOv11 Small
-    EPOCHS = 100                        # 训练轮数
+    EPOCHS = 50                         # 训练轮数（从零训练=100，微调=50）
     IMG_SIZE = 640                      # 输入图像尺寸
     BATCH = 32                          # 初始 batch size（OOM 时自动降级）
     WORKERS = 8                         # 数据加载线程数（12 核 CPU 的 2/3）
@@ -142,6 +142,8 @@ def run_training(
     amp: bool = Config.AMP,
     device: int = Config.DEVICE,
     model_output_dir: Optional[Path] = None,
+    resume: bool = False,
+    pretrained_path: Optional[str] = None,
 ) -> dict:
     """执行 YOLOv11 训练。
 
@@ -159,8 +161,22 @@ def run_training(
         model_output_dir = Path(__file__).resolve().parent / "data" / "models"
     model_output_dir.mkdir(parents=True, exist_ok=True)
 
-    pretrained = f"{model_name}.pt"
-    print(f"\n[MODEL] 预训练权重: {pretrained}")
+    # 断点续训：自动查找 last.pt
+    if resume:
+        pretrained = _find_last_pt()
+        if pretrained is None:
+            print("[FAIL] --resume 但未找到 last.pt，请确认 runs/detect/train*/weights/last.pt 存在")
+            sys.exit(1)
+        print(f"\n[MODEL] 续训权重: {pretrained}")
+    elif pretrained_path:
+        pretrained = pretrained_path
+        if not Path(pretrained).exists():
+            print(f"[FAIL] 预训练模型不存在: {pretrained}")
+            sys.exit(1)
+        print(f"\n[MODEL] 增量微调权重: {pretrained}")
+    else:
+        pretrained = f"{model_name}.pt"
+        print(f"\n[MODEL] 预训练权重: {pretrained}")
 
     # 打印配置
     print()
@@ -176,6 +192,7 @@ def run_training(
     print(f"  Cache:         {cache}")
     print(f"  AMP:           {amp}")
     print(f"  Patience:      {patience}")
+    print(f"  Resume:        {resume}")
     print(f"  模型输出:      {model_output_dir / Config.OUTPUT_NAME}")
     print("=" * 60)
 
@@ -203,7 +220,8 @@ def run_training(
                 amp=amp,
                 device=device,
                 exist_ok=True,
-                pretrained=True,
+                pretrained=not resume,
+                resume=resume,
                 verbose=True,
                 # 数据增强
                 hsv_h=0.015,
@@ -293,6 +311,26 @@ def extract_metrics(results) -> dict:
     return metrics
 
 
+def _find_last_pt() -> Optional[Path]:
+    """查找最新的 last.pt 用于断点续训。"""
+    candidates = [
+        Path.cwd() / "runs" / "detect",
+        Path("/root/autodl-tmp/runs/detect"),
+    ]
+    for runs_dir in candidates:
+        if runs_dir.exists():
+            train_dirs = sorted(
+                runs_dir.glob("train*"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            for d in train_dirs:
+                last_path = d / "weights" / "last.pt"
+                if last_path.exists():
+                    return last_path
+    return None
+
+
 def _find_best_pt(results) -> Optional[Path]:
     """查找训练产出的 best.pt 文件。"""
     if hasattr(results, "save_dir"):
@@ -350,16 +388,21 @@ def main() -> None:
 
     parser.add_argument("--data", type=str, help="data.yaml 配置文件路径")
     parser.add_argument("--model", type=str, default=Config.MODEL_NAME,
-                        help=f"预训练模型 (默认: {Config.MODEL_NAME})")
+                        help=f"预训练模型名 (默认: {Config.MODEL_NAME})")
+    parser.add_argument("--pretrained", type=str, default=None,
+                        help="增量微调：指定已有 .pt 路径（不写 --model，写完整路径）")
     parser.add_argument("--epochs", type=int, default=Config.EPOCHS)
     parser.add_argument("--img-size", type=int, default=Config.IMG_SIZE)
     parser.add_argument("--batch", type=int, default=Config.BATCH)
     parser.add_argument("--workers", type=int, default=Config.WORKERS)
     parser.add_argument("--patience", type=int, default=Config.PATIENCE)
-    parser.add_argument("--no-cache", action="store_true", help="禁用 RAM 缓存")
+    parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
+    parser.add_argument("--cache-disk", action="store_true", help="使用磁盘缓存（内存不足时替代 ram）")
     parser.add_argument("--no-amp", action="store_true", help="禁用 AMP")
     parser.add_argument("--device", type=int, default=Config.DEVICE)
     parser.add_argument("--output-dir", type=Path, default=None, help="模型输出目录")
+    parser.add_argument("--resume", action="store_true", help="从中断点恢复训练")
+    parser.add_argument("--auto-shutdown", action="store_true", help="训练完成后自动关机")
     parser.add_argument("--check-env", action="store_true", help="仅检查环境")
 
     args = parser.parse_args()
@@ -385,14 +428,21 @@ def main() -> None:
         batch=args.batch,
         workers=args.workers,
         patience=args.patience,
-        cache=False if args.no_cache else Config.CACHE,
+        cache="disk" if args.cache_disk else (False if args.no_cache else Config.CACHE),
         amp=False if args.no_amp else Config.AMP,
         device=args.device,
         model_output_dir=args.output_dir,
+        resume=args.resume,
+        pretrained_path=args.pretrained,
     )
 
     print(f"\n[DONE] 训练完成!")
     print(f"  模型: {metrics.get('output_model', 'N/A')}")
+
+    if args.auto_shutdown:
+        import subprocess
+        print("\n[AUTO-SHUTDOWN] 60秒后自动关机...")
+        subprocess.run(["shutdown", "-h", "+1"])
 
 
 if __name__ == "__main__":

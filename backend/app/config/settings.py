@@ -1,6 +1,7 @@
 """全局配置模块。"""
 
 from pathlib import Path
+from typing import Optional
 
 from pydantic import computed_field, ConfigDict
 from pydantic_settings import BaseSettings
@@ -40,7 +41,11 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "liu13568610305"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    # REFRESH_TOKEN_EXPIRE_DAYS: int = 7  # 暂未实现 Refresh Token 接口
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7  # 注意：Refresh Token 接口尚未实现
+    AUTH_COOKIE_NAME: str = "access_token"
+    AUTH_COOKIE_SECURE: bool = False
+    AUTH_COOKIE_SAMESITE: str = "lax"
+    AUTH_COOKIE_DOMAIN: Optional[str] = None
 
     # 大模型配置（实际值从 .env 加载）
     OPENAI_API_KEY: str = ""
@@ -60,6 +65,11 @@ class Settings(BaseSettings):
     MODELS_DIR: Path = Path(__file__).resolve(
     ).parent.parent.parent / "data" / "models"
     LOGS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "logs"
+    UPLOADS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "data" / "agent_uploads"
+    MAX_IMAGE_SIZE_MB: int = 10
+    DETECTION_MODE: str = "yolo"
+    DEFAULT_DETECTION_MODEL: str = "yolo11_food_best.pt"
+    VISION_MODEL: str = "Qwen/Qwen2.5-VL-32B-Instruct"
 
     @computed_field
     @property

@@ -78,6 +78,50 @@ class BoundingBox(BaseModel):
     class_name_cn: Optional[str] = Field(default=None, description="类别中文名")
     confidence: float = Field(..., ge=0.0, le=1.0, description="置信度")
     bbox: List[float] = Field(..., description="边界框坐标 [x1, y1, x2, y2]")
+    low_confidence: bool = Field(default=False, description="低置信度标记（<0.25），供 Agent 判断")
+
+
+class ChatRequest(BaseModel):
+    """发送给营养智能体的消息。"""
+
+    message: str = Field(default="", max_length=4000,
+                         description="用户消息；有检测结果时可为空")
+    session_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="会话 ID；不传时由服务端生成",
+    )
+    detections: List[BoundingBox] = Field(
+        default_factory=list,
+        max_length=100,
+        description="YOLO 返回的食物检测结果",
+    )
+
+
+class AgentToolCall(BaseModel):
+    """智能体执行过的工具调用。"""
+
+    name: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatResponse(BaseModel):
+    """营养智能体响应。"""
+
+    session_id: str
+    response: str
+    tool_calls: List[AgentToolCall] = Field(default_factory=list)
+    analysis_result: Optional[str] = None
+
+
+class ImageChatResponse(ChatResponse):
+    """图片营养分析响应。"""
+
+    image_id: str
+    detection_mode: str
+    detections: List[BoundingBox] = Field(default_factory=list)
 
 
 class DetectionResponse(BaseModel):
@@ -186,6 +230,26 @@ class ModelInfoResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class TrainingMetricsLineChart(BaseModel):
+    """训练折线图数据 — 每个 epoch 的指标，前端直接用于 Chart.js/ECharts"""
+    task_uuid: str = Field(..., description="训练任务 UUID")
+    model_name: str = Field(..., description="模型名称")
+    epochs: List[dict] = Field(
+        default_factory=list,
+        description="per-epoch 数据，每项含 epoch/train_box_loss/train_cls_loss/val_box_loss/val_cls_loss/mAP50/mAP50_95/precision/recall"
+    )
+    final_metrics: Optional[dict] = Field(default=None, description="最终汇总指标")
+
+
+class DetectionUploadResponse(BaseModel):
+    """图片上传检测响应（兼容现有 DetectionResponse）"""
+    task_id: Optional[int] = Field(default=None, description="任务数据库 ID")
+    task_uuid: str = Field(..., description="任务 UUID")
+    detections: list = Field(default_factory=list, description="检测结果列表")
+    total_objects: int = Field(default=0, description="检测到的目标总数")
+    inference_time: float = Field(..., description="推理耗时（秒）")
+
+
 # ============================================================
 # 食物营养相关 Schema（Agent 工具用）
 # ============================================================
@@ -228,6 +292,70 @@ class PaginationParams(BaseModel):
     """分页参数"""
     page: int = Field(default=1, ge=1, description="页码")
     page_size: int = Field(default=20, ge=1, le=100, description="每页大小")
+
+
+# ============================================================
+# 用户管理相关 Schema（Dashboard 管理端）
+# ============================================================
+
+class UserListItem(BaseModel):
+    """用户列表项"""
+    id: int
+    username: str
+    email: str
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+    is_active: bool
+    is_superuser: bool
+    roles: List[str] = []
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserListResponse(BaseModel):
+    """用户列表分页响应"""
+    items: List[UserListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class UserDetailResponse(BaseModel):
+    """用户详情响应"""
+    id: int
+    username: str
+    email: str
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+    is_active: bool
+    is_superuser: bool
+    roles: List[str] = []
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    # 扩展统计
+    total_detection_tasks: int = 0
+    total_training_tasks: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ToggleUserStatusRequest(BaseModel):
+    """启用/禁用用户请求"""
+    is_active: bool = Field(..., description="是否启用")
+
+
+class UpdateUserRoleRequest(BaseModel):
+    """修改用户角色请求"""
+    role_names: List[str] = Field(..., description="角色名称列表")
+
+
+class UpdateUserSuperuserRequest(BaseModel):
+    """修改用户管理员状态请求"""
+    is_superuser: bool = Field(..., description="是否超级管理员")
 
 
 # ============================================================

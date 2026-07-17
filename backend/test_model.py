@@ -39,7 +39,7 @@ def test_inference(model, image_path: str):
         return
 
     print("\n[2/2] 推理: %s" % image_path)
-    results = model.predict(source=image_path, conf=0.25, verbose=False)
+    results = model.predict(source=image_path, conf=0.1, verbose=False)
     result = results[0]
 
     if result.boxes is None or len(result.boxes) == 0:

@@ -67,10 +67,9 @@ async def get_current_user(
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
-    """获取当前⽤户（⽀持 Header 和 Cookie 双通道）"""
+    """获取当前用户：Bearer Header 优先，缺失时读取 HttpOnly Cookie。"""
     from app.entity.db_models import User
 
-    # 如果 Header 中没有 Token，尝试从 Cookie 获取
     if not token:
         token = request.cookies.get("access_token")
 
@@ -110,3 +109,15 @@ async def get_current_user(
         )
 
     return user
+
+
+async def require_admin(
+    current_user=Depends(get_current_user),
+):
+    """要求管理员身份（is_superuser=True）。"""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="需要管理员权限",
+        )
+    return current_user

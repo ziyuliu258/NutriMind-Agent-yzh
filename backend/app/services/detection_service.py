@@ -173,6 +173,7 @@ class DetectionService:
                 class_name_cn=class_names_cn.get(class_id),
                 confidence=round(confidence, 4),
                 bbox=[round(v, 2) for v in bbox_values],
+                low_confidence=confidence < 0.25,
             )
             detections.append(detection)
 
@@ -187,7 +188,7 @@ class DetectionService:
         db: Session,
         scene_id: int,
         image_path: str,
-        conf_threshold: float = 0.25,
+        conf_threshold: float = 0.1,
         iou_threshold: float = 0.45,
         user_id: Optional[int] = None,
     ) -> DetectionResponse:
@@ -281,7 +282,7 @@ class DetectionService:
         db: Session,
         scene_id: int,
         image_bytes: bytes,
-        conf_threshold: float = 0.25,
+        conf_threshold: float = 0.1,
         iou_threshold: float = 0.45,
         user_id: Optional[int] = None,
     ) -> DetectionResponse:

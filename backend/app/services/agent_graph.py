@@ -33,9 +33,11 @@ from app.services.agent_prompts import (
 )
 from app.services.agent_tools import (
     calculate_total_nutrition,
+    detect_food,
     query_food_by_category,
     query_food_calories,
     save_detection_record,
+    vision_verify_food,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ class AgentState(TypedDict, total=False):
     detections: Optional[list[dict]]
     user_id: Optional[int]
     analysis_result: Optional[str]
+    image_id: Optional[str]
 
 
 # ==================================================================
@@ -68,6 +71,11 @@ class AgentState(TypedDict, total=False):
 from langchain_core.tools import StructuredTool
 
 AGENT_TOOLS = [
+    StructuredTool.from_function(
+        coroutine=detect_food,
+        name="detect_food",
+        description="识别已上传餐食图片中的食物。必须传入系统提供的 image_id，可选置信度阈值。返回标准 YOLO detections JSON。",
+    ),
     StructuredTool.from_function(
         coroutine=query_food_calories,
         name="query_food_calories",
@@ -86,7 +94,12 @@ AGENT_TOOLS = [
     StructuredTool.from_function(
         coroutine=save_detection_record,
         name="save_detection_record",
-        description="将 YOLOv11 检测结果持久化保存到数据库。输入为 user_id(int), scene_id(int), detections_json(str)。",
+        description="将检测结果持久化保存到数据库。输入为 user_id(int), scene_id(int), detections_json(str)。",
+    ),
+    StructuredTool.from_function(
+        coroutine=vision_verify_food,
+        name="vision_verify_food",
+        description="视觉识别兜底。当 YOLO 检测失败、模型不存在、或检测结果低置信度时，调用多模态 LLM 直接观察图片识别食物。输入为 image_id。返回识别的食物列表 JSON。",
     ),
 ]
 
@@ -231,6 +244,7 @@ async def run_agent(
     session_id: str,
     user_message: str,
     detections: Optional[list[dict]] = None,
+    image_id: Optional[str] = None,
     user_id: Optional[int] = None,
 ) -> dict:
     """运行 Agent 管道的主入口函数。
@@ -264,7 +278,20 @@ async def run_agent(
     # 构造初始消息
     messages = []
 
-    # 如果有检测结果，将其注入为上下文
+    # 图片只以安全 image_id 进入状态；由 Agent 自主决定并调用 detect_food。
+    if image_id:
+        messages.append(
+            HumanMessage(
+                content=(
+                    "[IMAGE_CONTEXT]\n"
+                    f"用户已上传一张餐食图片，image_id={image_id}。\n"
+                    "你必须先调用 detect_food 工具观察图片检测结果，不能猜测图片内容；"
+                    "得到食物列表后，再按用户问题决定是否查询和计算营养。"
+                )
+            )
+        )
+
+    # 兼容已有系统直接提供检测结果的场景
     if detections:
         detection_text = format_detection_for_prompt(detections)
         context_msg = (
@@ -282,12 +309,17 @@ async def run_agent(
         return {"response": "未提供任何消息或检测结果。", "tool_calls": [], "analysis_result": None}
 
     # 配置（session_id 作为 thread_id 用于内存检查点）
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        # 防止模型持续重复调用工具而形成无限循环。
+        "recursion_limit": 12,
+    }
 
     # 构建初始状态
     initial_state: AgentState = {
         "messages": messages,
         "detections": detections,
+        "image_id": image_id,
         "user_id": user_id,
         "analysis_result": None,
     }
@@ -300,6 +332,8 @@ async def run_agent(
         all_messages = final_state.get("messages", [])
         response_text = ""
         tool_calls_log = []
+        detected_foods = []
+        detection_mode = None
 
         for msg in all_messages:
             if isinstance(msg, AIMessage):
@@ -311,6 +345,14 @@ async def run_agent(
                             "name": tc.get("name", "unknown"),
                             "args": tc.get("args", {}),
                         })
+            elif isinstance(msg, ToolMessage) and getattr(msg, "name", None) == "detect_food":
+                try:
+                    tool_result = json.loads(msg.content)
+                    if tool_result.get("success"):
+                        detected_foods = tool_result.get("detections", [])
+                        detection_mode = tool_result.get("mode")
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("无法解析 detect_food 工具结果")
 
         analysis = final_state.get("analysis_result")
 
@@ -318,12 +360,16 @@ async def run_agent(
             "response": response_text,
             "tool_calls": tool_calls_log,
             "analysis_result": analysis,
+            "detections": detected_foods,
+            "detection_mode": detection_mode,
         }
 
     except Exception as exc:
-        logger.error(f"Agent 执行失败: {exc}")
+        logger.exception("Agent 执行失败")
         return {
-            "response": f"抱歉，营养分析过程出现错误：{exc}。请稍后重试。",
+            "response": "抱歉，营养分析暂时不可用，请稍后重试。",
             "tool_calls": [],
             "analysis_result": None,
+            "detections": [],
+            "detection_mode": None,
         }
