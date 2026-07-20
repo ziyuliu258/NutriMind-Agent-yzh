@@ -226,7 +226,7 @@ DEFAULT_DETECTION_MODEL=yolo11_food_best.pt
 
 ## 🧠 YOLO 模型训练
 
-模型基于 [UECFOOD-256](http://foodcam.mobi/dataset256.html) 数据集训练，详细流程见 [`backend/train_yolo.py`](backend/train_yolo.py) 与 [`AI_Engineer_Handoff.md`](AI_Engineer_Handoff.md)。
+模型基于 [UECFOOD-256](http://foodcam.mobi/dataset256.html) 数据集训练，详细流程见 [`backend/train_yolo.py`](backend/train_yolo.py)。
 
 **训练配置：**
 - 基础模型：`yolo11s.pt` (COCO 预训练)
@@ -278,14 +278,6 @@ YOLO11s (conf=0.1)
 - [ ] Alembic 数据库迁移配置
 - [ ] YOLOE 开放词汇食物检测（突破 256 类限制）
 - [ ] MinIO 对象存储接入
-
----
-
-## 🤝 协作与文档
-
-- [`AI_Engineer_Handoff.md`](AI_Engineer_Handoff.md) — AI / 算法工程师开发交接文档
-- [`doc/API.md`](doc/API.md) — 权威 API 文档
-- [`doc/API对齐.md`](doc/API对齐.md) — 认证契约对齐说明
 
 ---
 
