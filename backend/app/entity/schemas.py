@@ -116,6 +116,28 @@ class ChatResponse(BaseModel):
     analysis_result: Optional[str] = None
 
 
+class ChatSessionCreate(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=200)
+
+
+class ChatMessageResponse(BaseModel):
+    id: int
+    role: str
+    content: str
+    tool_calls: List[AgentToolCall] = Field(default_factory=list)
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ChatSessionResponse(BaseModel):
+    session_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    messages: List[ChatMessageResponse] = Field(default_factory=list)
+
+
 class ImageChatResponse(ChatResponse):
     """图片营养分析响应。"""
 

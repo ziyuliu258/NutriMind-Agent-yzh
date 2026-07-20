@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from sqlalchemy import text
 
 from app.config.settings import settings
+from app.services.web_search_service import web_search_service
 import logging
 
 logger = logging.getLogger(__name__)
@@ -168,8 +169,8 @@ class KnowledgeService:
 
     async def embed_and_store(self, file_path: str, user_id: int = 0) -> int:
         """加载、分块、向量化并存储文档"""
-        self._initialize()
         try:
+            self._initialize()
             # 加载文档（同步操作，放在线程池执行）
             import asyncio
             documents = await asyncio.to_thread(self.load_document, file_path)
@@ -196,8 +197,8 @@ class KnowledgeService:
 
     async def search(self, query: str, k: int = 5, user_id: int = 0) -> List[Dict[str, Any]]:
         """语义检索（可选按用户过滤）。"""
-        self._initialize()
         try:
+            self._initialize()
             import asyncio
             # 多取一些结果再过滤，保证返回 k 条
             fetch_k = k * 3 if user_id else k
@@ -221,10 +222,110 @@ class KnowledgeService:
             logger.error(f"知识库检索失败: {e}")
             return []
 
+    async def store_web_results(self, query: str, results: List[Dict[str, Any]], user_id: int) -> int:
+        """把联网检索语料写入用户向量库，供后续 RAG 复用。"""
+        if not results:
+            return 0
+        self._initialize()
+        from langchain_core.documents import Document
+        import asyncio
+
+        documents = []
+        for item in results:
+            content = item.get("content", "").strip()
+            if not content:
+                continue
+            documents.append(Document(page_content=content, metadata={
+                "source": item.get("url") or "exa",
+                "file_name": item.get("title") or "联网检索",
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "source_type": "web",
+                "provider": item.get("provider", "exa"),
+                "query": query,
+                "user_id": str(user_id),
+            }))
+        if not documents:
+            return 0
+        await asyncio.to_thread(self.vector_store.add_documents, documents)
+        return len(documents)
+
+    async def retrieve_with_fallback(
+        self,
+        query: str,
+        k: int = 5,
+        user_id: int = 0,
+        verify_web: bool = False,
+        store_web: bool = True,
+    ) -> Dict[str, Any]:
+        """先查私有知识库；结果不足时联网，并可用网页来源交叉验证。"""
+        local_results = await self.search(query, k=k, user_id=user_id)
+        best_score = min((item.get("score", float("inf")) for item in local_results), default=float("inf"))
+        needs_fallback = not local_results or best_score > settings.KNOWLEDGE_LOCAL_SCORE_THRESHOLD
+        web_results = []
+        if needs_fallback or verify_web:
+            web_results = await web_search_service.search(query, limit=k)
+            if web_results and store_web and settings.WEB_SEARCH_STORE_RESULTS:
+                try:
+                    await self.store_web_results(query, web_results, user_id)
+                except Exception as exc:
+                    logger.warning("联网语料落库失败，不影响本次回答: %s", exc)
+        return {
+            "local_results": local_results,
+            "web_results": web_results,
+            "used_web_fallback": needs_fallback and bool(web_results),
+            "cross_verified": bool(local_results and web_results),
+        }
+
+    async def answer(
+        self,
+        query: str,
+        k: int = 5,
+        user_id: int = 0,
+        verify_web: bool = False,
+        store_web: bool = True,
+    ) -> Dict[str, Any]:
+        """RAG 问答：返回自然语言回答和可展示的关联来源。"""
+        retrieved = await self.retrieve_with_fallback(query, k, user_id, verify_web, store_web)
+        sources = []
+        contexts = []
+        for index, item in enumerate(retrieved["local_results"], 1):
+            metadata = item.get("metadata", {})
+            sources.append({
+                "id": f"local-{index}", "type": "knowledge",
+                "title": metadata.get("file_name") or metadata.get("source") or "知识库文档",
+                "url": metadata.get("url"), "score": item.get("score"),
+                "excerpt": item.get("content", "")[:300],
+            })
+            contexts.append(f"[local-{index}] {item.get('content', '')}")
+        for index, item in enumerate(retrieved["web_results"], 1):
+            sources.append({
+                "id": f"web-{index}", "type": "web", "title": item.get("title"),
+                "url": item.get("url"), "score": None,
+                "excerpt": item.get("content", "")[:300],
+            })
+            contexts.append(f"[web-{index}] {item.get('content', '')}")
+
+        if not contexts:
+            return {"answer": "当前知识库和联网检索均未找到足够可靠的相关资料。请换一种问法，或先上传相关营养资料。", "sources": [], **retrieved}
+
+        from langchain_openai import ChatOpenAI
+        llm = ChatOpenAI(
+            model=settings.OPENAI_MODEL, openai_api_key=settings.OPENAI_API_KEY,
+            openai_api_base=settings.OPENAI_BASE_URL, temperature=0.2,
+        )
+        prompt = (
+            "你是严谨的营养知识助手。只根据下列资料回答问题，写成一段清晰、完整的中文回答；"
+            "重要结论后用 [local-1] 或 [web-1] 标注来源。资料冲突时明确指出，不要编造。"
+            "这不是医疗诊断。\n\n问题：" + query + "\n\n资料：\n" + "\n\n".join(contexts)
+        )
+        response = await llm.ainvoke(prompt)
+        return {"answer": str(response.content), "sources": sources, **retrieved}
+
     async def delete_by_source(self, source: str, user_id: int = 0) -> bool:
         """按来源删除文档（仅允许删除自己上传的）。"""
-        self._initialize()
         try:
+            self._initialize()
             from sqlalchemy import create_engine, text
             engine = create_engine(settings.DATABASE_URL)
             with engine.connect() as conn:
@@ -244,8 +345,8 @@ class KnowledgeService:
 
     async def get_collection_stats(self, user_id: int = 0) -> Dict[str, Any]:
         """获取统计信息（可选按用户过滤）。"""
-        self._initialize()
         try:
+            self._initialize()
             from sqlalchemy import create_engine, text
             engine = create_engine(settings.DATABASE_URL)
             with engine.connect() as conn:

@@ -17,6 +17,7 @@ Agent 图编排模块 — 使用 LangGraph 将 LLM 与工具节点连接。
 
 import json
 import logging
+import uuid
 from typing import Annotated, Any, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -32,11 +33,14 @@ from app.services.agent_prompts import (
     format_detection_for_prompt,
 )
 from app.services.agent_tools import (
+    agent_user_id,
     calculate_total_nutrition,
     detect_food,
     query_food_by_category,
     query_food_calories,
     save_detection_record,
+    search_nutrition_knowledge,
+    search_web_evidence,
     vision_verify_food,
 )
 
@@ -100,6 +104,16 @@ AGENT_TOOLS = [
         coroutine=vision_verify_food,
         name="vision_verify_food",
         description="视觉识别兜底。当 YOLO 检测失败、模型不存在、或检测结果低置信度时，调用多模态 LLM 直接观察图片识别食物。输入为 image_id。返回识别的食物列表 JSON。",
+    ),
+    StructuredTool.from_function(
+        coroutine=search_nutrition_knowledge,
+        name="search_nutrition_knowledge",
+        description="检索当前用户的营养知识库；本地资料不足时自动联网。输入 query 和可选 verify_web，用户身份由系统安全注入。返回本地片段和网页来源 JSON。",
+    ),
+    StructuredTool.from_function(
+        coroutine=search_web_evidence,
+        name="search_web_evidence",
+        description="使用 Exa 联网检索营养资料进行 fallback 或交叉验证。输入 query 和可选 limit，返回带标题、URL、正文的来源 JSON。",
     ),
 ]
 
@@ -246,6 +260,7 @@ async def run_agent(
     detections: Optional[list[dict]] = None,
     image_id: Optional[str] = None,
     user_id: Optional[int] = None,
+    history: Optional[list[BaseMessage]] = None,
 ) -> dict:
     """运行 Agent 管道的主入口函数。
 
@@ -276,7 +291,7 @@ async def run_agent(
     executor = _get_executor()
 
     # 构造初始消息
-    messages = []
+    messages = list(history or [])
 
     # 图片只以安全 image_id 进入状态；由 Agent 自主决定并调用 detect_food。
     if image_id:
@@ -309,8 +324,10 @@ async def run_agent(
         return {"response": "未提供任何消息或检测结果。", "tool_calls": [], "analysis_result": None}
 
     # 配置（session_id 作为 thread_id 用于内存检查点）
+    # 数据库历史存在时，每次调用使用独立图线程，避免 MemorySaver 与持久化历史重复叠加。
+    thread_id = f"{session_id}:{uuid.uuid4()}" if history is not None else session_id
     config = {
-        "configurable": {"thread_id": session_id},
+        "configurable": {"thread_id": thread_id},
         # 防止模型持续重复调用工具而形成无限循环。
         "recursion_limit": 12,
     }
@@ -326,7 +343,11 @@ async def run_agent(
 
     try:
         # 执行图
-        final_state = await executor.ainvoke(initial_state, config)
+        user_token = agent_user_id.set(user_id or 0)
+        try:
+            final_state = await executor.ainvoke(initial_state, config)
+        finally:
+            agent_user_id.reset(user_token)
 
         # 提取最后一条 AI 消息作为回复
         all_messages = final_state.get("messages", [])

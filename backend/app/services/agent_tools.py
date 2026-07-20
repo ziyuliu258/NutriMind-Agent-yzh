@@ -16,16 +16,20 @@ import asyncio
 import base64
 import json
 import logging
+from contextvars import ContextVar
 from pathlib import Path
 from sqlalchemy.exc import SQLAlchemyError
 from app.config.settings import settings
 from app.database.session import get_session_local
 from app.entity.db_models import DetectionScene, DetectionTask, FoodNutrition, User
 from app.services.image_store import image_store
+from app.services.knowledge_service import knowledge_service
+from app.services.web_search_service import web_search_service
 
 logger = logging.getLogger(__name__)
 _yolo_model = None
 _vision_llm = None
+agent_user_id: ContextVar[int] = ContextVar("agent_user_id", default=0)
 
 
 def SessionLocal():
@@ -636,3 +640,35 @@ async def save_detection_record(
             db.close()
 
     return await asyncio.to_thread(_save_sync, user_id, scene_id, detections_json)
+
+
+async def search_nutrition_knowledge(
+    query: str,
+    verify_web: bool = True,
+) -> str:
+    """检索用户营养知识库；不足时自动使用 Exa 联网，并返回可引用来源。"""
+    user_id = agent_user_id.get()
+    try:
+        result = await knowledge_service.retrieve_with_fallback(
+            query=query, k=5, user_id=user_id, verify_web=verify_web, store_web=True,
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as exc:
+        logger.warning("知识库检索不可用，直接尝试联网: %s", exc)
+        web_results = await web_search_service.search(query, limit=5)
+        return json.dumps({
+            "local_results": [], "web_results": web_results,
+            "used_web_fallback": bool(web_results), "cross_verified": False,
+        }, ensure_ascii=False)
+
+
+async def search_web_evidence(query: str, limit: int = 5) -> str:
+    """通过 Exa 搜索可信网页资料，用于交叉验证营养知识和时效性信息。"""
+    results = await web_search_service.search(query, limit=limit)
+    if not results:
+        return json.dumps({
+            "success": False,
+            "error": "联网搜索不可用或未配置 EXA_API_KEY",
+            "results": [],
+        }, ensure_ascii=False)
+    return json.dumps({"success": True, "provider": "exa", "results": results}, ensure_ascii=False)

@@ -13,6 +13,7 @@ from app.config.settings import settings
 from app.services.agent_tools import calculate_total_nutrition, detect_food, query_food_calories
 from app.services.image_store import image_store
 from app.services import agent_graph
+from app.services import chat_service
 
 
 def _mock_user():
@@ -262,3 +263,27 @@ def test_langgraph_runs_detection_then_nutrition_tools(tmp_path):
     ]
     assert result["detections"][0]["class_name"] == "rice"
     assert "174 kcal" in result["response"]
+
+
+def test_persistent_chat_session_can_resume(db):
+    user = User(
+        id=701, username="resume-user", email="resume@example.com",
+        hashed_password="hash", is_active=True,
+    )
+    db.add(user)
+    db.commit()
+
+    session = chat_service.create_session(db, user.id, "resume-001", "营养问答")
+    chat_service.append_message(db, session, "user", "燕麦有什么营养？")
+    chat_service.append_message(db, session, "assistant", "燕麦富含膳食纤维。")
+
+    loaded = chat_service.get_session(db, user.id, "resume-001")
+    history = chat_service.history_as_langchain(loaded)
+    assert loaded.title == "营养问答"
+    assert [message.content for message in history] == ["燕麦有什么营养？", "燕麦富含膳食纤维。"]
+
+
+def test_agent_registers_knowledge_and_web_tools():
+    tool_names = {tool.name for tool in agent_graph.AGENT_TOOLS}
+    assert "search_nutrition_knowledge" in tool_names
+    assert "search_web_evidence" in tool_names

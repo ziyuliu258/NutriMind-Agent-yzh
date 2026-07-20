@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     OPENAI_BASE_URL: str = "https://api.siliconflow.cn/v1"
     OPENAI_MODEL: str = "Qwen/Qwen3.6-35B-A3B"
 
+    # 联网检索（Exa）。未配置密钥时知识库仍可独立工作，联网 fallback 会优雅降级。
+    EXA_API_KEY: str = ""
+    EXA_SEARCH_URL: str = "https://api.exa.ai/search"
+    WEB_SEARCH_ENABLED: bool = True
+    WEB_SEARCH_STORE_RESULTS: bool = True
+    KNOWLEDGE_LOCAL_SCORE_THRESHOLD: float = 0.85
+
     # LangChain 配置（可选）
     LANGCHAIN_TRACING_V2: bool = False
     LANGCHAIN_API_KEY: str = ""

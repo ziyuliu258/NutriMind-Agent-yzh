@@ -82,6 +82,30 @@ async def search_knowledge(
         logger.error(f"知识库检索失败: {e}")
         raise HTTPException(status_code=500, detail=f"检索失败: {str(e)}")
 
+
+@router.get("/ask", response_model=ApiResponse)
+async def ask_knowledge(
+    query: str = ...,
+    k: int = 5,
+    verify_web: bool = False,
+    store_web: bool = True,
+    current_user: User = Depends(get_current_user),
+):
+    """营养知识问答：返回自然语言回答、关联知识库片段和网页来源。"""
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="查询内容不能为空")
+    if k < 1 or k > 10:
+        raise HTTPException(status_code=400, detail="k 必须在 1 到 10 之间")
+    try:
+        result = await knowledge_service.answer(
+            query=query.strip(), k=k, user_id=current_user.id,
+            verify_web=verify_web, store_web=store_web,
+        )
+        return ApiResponse(code=200, data={"query": query.strip(), **result})
+    except Exception as e:
+        logger.exception("知识库问答失败")
+        raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}") from e
+
 @router.delete("/", response_model=ApiResponse)
 async def delete_document(
     source: str = ...,

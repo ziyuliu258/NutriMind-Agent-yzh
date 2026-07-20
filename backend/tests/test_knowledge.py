@@ -4,10 +4,11 @@
 """
 
 import os
+import asyncio
 import tempfile
 import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import AsyncMock, patch, MagicMock
 from io import BytesIO
 from fastapi.testclient import TestClient
 
@@ -232,6 +233,44 @@ class TestKnowledgeAPI:
         
         response = test_client.delete("/api/knowledge/?source=test")
         assert response.status_code in [200, 401, 404, 500]
+
+
+def test_knowledge_ask_returns_answer_and_sources(test_client):
+    result = {
+        "answer": "燕麦含有较丰富的可溶性膳食纤维。[local-1]",
+        "sources": [{
+            "id": "local-1", "type": "knowledge", "title": "燕麦资料",
+            "url": None, "score": 0.2, "excerpt": "燕麦含膳食纤维",
+        }],
+        "local_results": [], "web_results": [],
+        "used_web_fallback": False, "cross_verified": False,
+    }
+    with patch(
+        "app.api.knowledge.knowledge_service.answer",
+        new=AsyncMock(return_value=result),
+    ):
+        response = test_client.get("/api/knowledge/ask", params={"query": "燕麦有什么营养"})
+
+    assert response.status_code == 200
+    assert response.json()["data"]["answer"].startswith("燕麦")
+    assert response.json()["data"]["sources"][0]["id"] == "local-1"
+
+
+def test_retrieval_uses_web_fallback_when_local_results_are_empty():
+    from app.services.knowledge_service import KnowledgeService
+
+    service = KnowledgeService()
+    with patch.object(service, "search", new=AsyncMock(return_value=[])), patch(
+        "app.services.knowledge_service.web_search_service.search",
+        new=AsyncMock(return_value=[{
+            "title": "权威营养资料", "url": "https://example.org/nutrition",
+            "content": "可靠资料", "source_type": "web", "provider": "exa",
+        }]),
+    ), patch.object(service, "store_web_results", new=AsyncMock(return_value=1)):
+        result = asyncio.run(service.retrieve_with_fallback("每日蛋白质摄入", user_id=1))
+
+    assert result["used_web_fallback"] is True
+    assert result["web_results"][0]["provider"] == "exa"
 
 
 if __name__ == "__main__":
