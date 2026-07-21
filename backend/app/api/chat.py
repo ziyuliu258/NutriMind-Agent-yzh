@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from app.core.security import get_current_user
 from app.config.settings import settings
-from app.entity.db_models import User
+from app.entity.db_models import BodyProfile, GoalProfile, User
 from app.database.session import get_db
 from app.entity.schemas import (
     BoundingBox, ChatRequest, ChatResponse, ChatSessionCreate,
@@ -23,6 +23,34 @@ from app.services.image_store import image_store
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["AI 对话"])
+
+
+def _agent_profile(db: Session | None, user_id: int | None) -> dict | None:
+    """读取营养相关资料，并排除手机号、邮箱、用户名等账户信息。"""
+    if db is None or user_id is None:
+        return None
+    try:
+        body = db.query(BodyProfile).filter(BodyProfile.user_id == user_id).first()
+        goal = db.query(GoalProfile).filter(GoalProfile.user_id == user_id).first()
+        return {
+            "body_profile": {
+                "current_weight_kg": body.current_weight_kg,
+                "height_cm": body.height_cm,
+                "birth_date": body.birth_date,
+                "sex_for_calculation": body.sex_for_calculation,
+                "activity_level": body.activity_level,
+            } if body else None,
+            "goal": {
+                "mode": goal.mode,
+                "target_weight_kg": goal.target_weight_kg,
+                "daily_calories_kcal": goal.daily_calories_kcal,
+                "protein_target_g": goal.protein_target_g,
+                "training_days_per_week": goal.training_days_per_week,
+            } if goal else None,
+        }
+    except Exception as exc:
+        logger.warning("读取 Agent 个性化资料失败，将使用通用上下文: %s", exc)
+        return None
 
 
 def _validate_request(request: ChatRequest) -> str:
@@ -59,6 +87,7 @@ async def _invoke_chat(
         detections=[item.model_dump() for item in request.detections] or None,
         user_id=user_id,
         history=history,
+        user_profile=_agent_profile(db, user_id),
     )
     if persisted_session is not None:
         try:
@@ -160,6 +189,7 @@ async def _invoke_image_chat(
     session_id: str | None,
     thread_prefix: str,
     user_id: int | None,
+    db: Session | None = None,
     mock_detections: list[dict] | None = None,
 ) -> ImageChatResponse:
     if not message.strip():
@@ -180,6 +210,7 @@ async def _invoke_image_chat(
         user_message=message.strip(),
         image_id=image_id,
         user_id=user_id,
+        user_profile=_agent_profile(db, user_id),
     )
     return ImageChatResponse(
         session_id=external_session_id,
@@ -198,6 +229,7 @@ async def analyze_image(
     message: str = Form(..., max_length=4000),
     session_id: str | None = Form(default=None),
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ) -> ImageChatResponse:
     """正式图片对话入口：Agent 主动调用真实 YOLO 工具（需要模型文件）。"""
     return await _invoke_image_chat(
@@ -206,6 +238,7 @@ async def analyze_image(
         session_id=session_id,
         thread_prefix=f"user:{current_user.id}:image",
         user_id=current_user.id,
+        db=db,
     )
 
 

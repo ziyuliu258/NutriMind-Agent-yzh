@@ -7,13 +7,14 @@ from langchain_core.messages import AIMessage, ToolMessage
 from fastapi.testclient import TestClient
 
 from app.core.security import get_current_user
-from app.entity.db_models import User
+from app.entity.db_models import BodyProfile, GoalProfile, User
 from main import app
 from app.config.settings import settings
 from app.services.agent_tools import calculate_total_nutrition, detect_food, query_food_calories
 from app.services.image_store import image_store
 from app.services import agent_graph
 from app.services import chat_service
+from app.services.agent_prompts import format_user_profile_for_prompt
 
 
 def _mock_user():
@@ -50,6 +51,82 @@ def test_chat_message_passes_detection_context():
     assert response.json()["tool_calls"][0]["name"] == "query_food_calories"
     assert mocked.await_args.kwargs["session_id"] == "user:7:meal-001"
     assert mocked.await_args.kwargs["detections"][0]["class_name"] == "apple"
+
+
+def test_chat_injects_saved_nutrition_profile(db):
+    user = _mock_user()
+    user.hashed_password = "test-hash"
+    db.add(user)
+    db.add(BodyProfile(
+        user_id=user.id, current_weight_kg=72, height_cm=175,
+        sex_for_calculation="male", activity_level="moderate",
+    ))
+    db.add(GoalProfile(
+        user_id=user.id, mode="cut", target_weight_kg=68,
+        daily_calories_kcal=2000, protein_target_g=130,
+        training_days_per_week=3,
+    ))
+    db.commit()
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        with patch(
+            "app.api.chat.run_agent",
+            new=AsyncMock(return_value={"response": "已结合目标", "tool_calls": [], "analysis_result": None}),
+        ) as mocked:
+            response = TestClient(app).post("/api/chat/message", json={"message": "晚饭怎么吃？"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    profile = mocked.await_args.kwargs["user_profile"]
+    assert profile["body_profile"]["current_weight_kg"] == 72
+    assert profile["goal"]["daily_calories_kcal"] == 2000
+    assert "phone" not in profile["body_profile"]
+
+
+def test_profile_prompt_formats_goals_without_account_data():
+    prompt = format_user_profile_for_prompt({
+        "body_profile": {"current_weight_kg": 72, "activity_level": "moderate"},
+        "goal": {"mode": "cut", "daily_calories_kcal": 2000, "protein_target_g": 130},
+    })
+
+    assert "主要目标: 减脂" in prompt
+    assert "当前体重: 72 kg" in prompt
+    assert "每日热量目标: 2000 kcal" in prompt
+    assert "日常活动水平: 中等活动" in prompt
+
+
+def test_real_exa_sources_are_appended_to_agent_response():
+    message = ToolMessage(
+        content='{"success":true,"provider":"exa","results":['
+        '{"title":"WHO healthy diet","url":"https://www.who.int/example","provider":"exa"},'
+        '{"title":"No URL","content":"ignored"}]}',
+        tool_call_id="web-1",
+        name="search_web_evidence",
+    )
+
+    sources = agent_graph._web_sources_from_tool_message(message)
+    response = agent_graph._append_web_sources("这是联网后的回答。", sources)
+
+    assert sources == [{
+        "title": "WHO healthy diet",
+        "url": "https://www.who.int/example",
+        "provider": "exa",
+    }]
+    assert "### 联网来源" in response
+    assert "[WHO healthy diet](https://www.who.int/example)" in response
+
+
+def test_knowledge_fallback_web_results_are_recognized_as_sources():
+    message = ToolMessage(
+        content='{"local_results":[],"web_results":['
+        '{"title":"Exa result","url":"https://example.com/source","provider":"exa"}],'
+        '"used_web_fallback":true}',
+        tool_call_id="knowledge-1",
+        name="search_nutrition_knowledge",
+    )
+
+    assert agent_graph._web_sources_from_tool_message(message)[0]["url"] == "https://example.com/source"
 
 
 def test_chat_rejects_empty_request():

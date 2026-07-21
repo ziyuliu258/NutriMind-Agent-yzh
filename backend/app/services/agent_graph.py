@@ -31,6 +31,7 @@ from app.config.settings import settings
 from app.services.agent_prompts import (
     SYSTEM_PROMPT,
     format_detection_for_prompt,
+    format_user_profile_for_prompt,
 )
 from app.services.agent_tools import (
     agent_user_id,
@@ -64,6 +65,7 @@ class AgentState(TypedDict, total=False):
     user_id: Optional[int]
     analysis_result: Optional[str]
     image_id: Optional[str]
+    user_profile: Optional[dict]
 
 
 # ==================================================================
@@ -113,7 +115,7 @@ AGENT_TOOLS = [
     StructuredTool.from_function(
         coroutine=search_web_evidence,
         name="search_web_evidence",
-        description="使用 Exa 联网检索营养资料进行 fallback 或交叉验证。输入 query 和可选 limit，返回带标题、URL、正文的来源 JSON。",
+        description="使用 Exa 真正联网搜索公开网页，用于最新信息、用户明确要求联网或需要网址来源的问答。输入 query 和可选 limit，返回本次搜索得到的标题、URL、正文和发布时间 JSON。",
     ),
 ]
 
@@ -159,9 +161,13 @@ async def agent_node(state: AgentState) -> dict:
     llm_with_tools = _get_llm()
     messages = state["messages"]
 
-    # 确保系统提示词在最前面
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(messages)
+    system_content = SYSTEM_PROMPT
+    profile_context = format_user_profile_for_prompt(state.get("user_profile"))
+    if profile_context:
+        system_content = f"{system_content}\n\n{profile_context}"
+    messages = [SystemMessage(content=system_content)] + [
+        message for message in messages if not isinstance(message, SystemMessage)
+    ]
 
     response = await llm_with_tools.ainvoke(messages)
     return {"messages": [response]}
@@ -249,6 +255,52 @@ def _get_executor():
     return _agent_executor
 
 
+def _web_sources_from_tool_message(message: ToolMessage) -> list[dict]:
+    """从联网相关工具的真实返回值中提取可展示来源。"""
+    if getattr(message, "name", None) not in {
+        "search_web_evidence", "search_nutrition_knowledge",
+    }:
+        return []
+    try:
+        payload = json.loads(message.content)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    results = payload.get("results") or payload.get("web_results") or []
+    sources = []
+    for item in results:
+        url = item.get("url")
+        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+            continue
+        sources.append({
+            "title": item.get("title") or url,
+            "url": url,
+            "provider": item.get("provider") or payload.get("provider") or "exa",
+        })
+    return sources
+
+
+def _append_web_sources(response: str, sources: list[dict]) -> str:
+    """确定性地把实际联网结果附在回答末尾，避免模型漏写或编造网址。"""
+    unique = []
+    seen_urls = set()
+    for source in sources:
+        if source["url"] in seen_urls:
+            continue
+        seen_urls.add(source["url"])
+        unique.append(source)
+    if not unique:
+        return response
+
+    lines = ["### 联网来源"]
+    for source in unique[:8]:
+        title = str(source["title"]).replace("[", "").replace("]", "").strip()
+        lines.append(f"- [{title}]({source['url']})")
+    source_block = "\n".join(lines)
+    if all(source["url"] in response for source in unique[:8]):
+        return response
+    return f"{response.rstrip()}\n\n{source_block}"
+
+
 # ==================================================================
 # 公开入口
 # ==================================================================
@@ -261,6 +313,7 @@ async def run_agent(
     image_id: Optional[str] = None,
     user_id: Optional[int] = None,
     history: Optional[list[BaseMessage]] = None,
+    user_profile: Optional[dict] = None,
 ) -> dict:
     """运行 Agent 管道的主入口函数。
 
@@ -338,6 +391,7 @@ async def run_agent(
         "detections": detections,
         "image_id": image_id,
         "user_id": user_id,
+        "user_profile": user_profile,
         "analysis_result": None,
     }
 
@@ -353,6 +407,7 @@ async def run_agent(
         all_messages = final_state.get("messages", [])
         response_text = ""
         tool_calls_log = []
+        web_sources = []
         detected_foods = []
         detection_mode = None
 
@@ -374,7 +429,18 @@ async def run_agent(
                         detection_mode = tool_result.get("mode")
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("无法解析 detect_food 工具结果")
+            elif isinstance(msg, ToolMessage):
+                web_sources.extend(_web_sources_from_tool_message(msg))
 
+        response_text = _append_web_sources(response_text, web_sources)
+        if web_sources and not any(
+            call["name"] in {"search_web_evidence", "exa_web_search"}
+            for call in tool_calls_log
+        ):
+            tool_calls_log.append({
+                "name": "exa_web_search",
+                "args": {"source_count": len({source["url"] for source in web_sources})},
+            })
         analysis = final_state.get("analysis_result")
 
         return {
