@@ -41,7 +41,7 @@ jobs:
       - name: Sync Capacitor Android project
         run: npx cap sync android
       - name: Build installable debug APK
-        run: ./android/gradlew --no-daemon assembleDebug
+        run: cd android && ./gradlew --no-daemon assembleDebug
       - name: Collect release APK
         run: |
           mkdir -p release-assets
