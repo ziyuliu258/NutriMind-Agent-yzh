@@ -7,3 +7,13 @@ export const getUserStatsApi = () => request.get('/dashboard/users')
 export const getDashboardStatsApi = (config = {}) => request.get('/dashboard/stats', config)
 export const getDetectionStatusDistributionApi = (config = {}) => request.get('/dashboard/detection/status-distribution', config)
 export const getTrainingStatusDistributionApi = (config = {}) => request.get('/dashboard/training/status-distribution', config)
+
+export const getAdminDetectionTasksApi = (params, config = {}) => request.get('/dashboard/detection/tasks', {
+  ...config,
+  params,
+})
+
+export const getAdminDetectionTaskDetailApi = (taskUuid, config = {}) => request.get(
+  `/dashboard/detection/tasks/${encodeURIComponent(taskUuid)}`,
+  config,
+)

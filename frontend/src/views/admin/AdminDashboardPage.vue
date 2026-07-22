@@ -141,7 +141,7 @@
             <span>用户统计</span>
             <h2 id="users-title" class="section-title">账户与活跃情况</h2>
           </div>
-          <p>“今日新增”按照后端 UTC 自然日统计。</p>
+          <p>“今日新增”按后端 UTC 自然日统计，对应北京时间每日 08:00 切换。</p>
         </header>
 
         <div class="user-metrics">

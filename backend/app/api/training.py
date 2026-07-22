@@ -5,7 +5,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.core.security import get_current_user
+from app.core.security import require_admin
 from app.database.session import get_db
 from app.entity.db_models import TrainingTask, User
 from app.entity.schemas import (
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/training", tags=["模型训练"])
 async def create_training_task(
     config: TrainingTaskCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """创建训练任务（状态 = pending），不立即启动。"""
     task = await training_service.create_task(db, config, user_id=current_user.id)
@@ -45,7 +45,7 @@ async def create_training_task(
 async def start_training(
     task_uuid: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """启动训练任务。仅 pending 状态可启动。"""
     try:
@@ -62,17 +62,13 @@ async def start_training(
 async def pause_training(
     task_uuid: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
-    """暂停训练任务。"""
-    try:
-        task = await training_service.pause_task(db, task_uuid)
-        return ApiResponse(
-            message="训练已暂停",
-            data={"task_uuid": task.task_uuid, "status": task.status},
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """当前训练引擎不支持可靠的暂停与恢复，禁止仅修改数据库状态。"""
+    raise HTTPException(
+        status_code=501,
+        detail="当前训练引擎尚不支持可靠的暂停与恢复",
+    )
 
 
 # ------------------------------------------------------------------
@@ -85,11 +81,11 @@ async def list_training_tasks(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
-    """分页查询训练任务列表（按创建时间倒序）。"""
+    """管理员分页查询全站训练任务（按创建时间倒序）。"""
     tasks, total = await training_service.get_tasks(
-        db, user_id=current_user.id, page=page, page_size=page_size
+        db, page=page, page_size=page_size
     )
     return TrainingTaskListResponse(
         items=[TrainingTaskResponse.model_validate(t) for t in tasks],
@@ -103,7 +99,7 @@ async def list_training_tasks(
 async def get_training_task(
     task_uuid: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """获取单个训练任务详情（含最终指标）。"""
     task = await training_service.get_task_by_uuid(db, task_uuid)
@@ -116,7 +112,7 @@ async def get_training_task(
 async def get_training_metrics(
     task_uuid: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_admin),
 ):
     """获取 per-epoch 训练指标，前端直接用于折线图。
 
@@ -145,14 +141,14 @@ async def get_training_metrics(
 
 
 @router.get("/models", response_model=ApiResponse)
-async def list_models(current_user: User = Depends(get_current_user)):
+async def list_models(current_user: User = Depends(require_admin)):
     """获取已有模型文件列表。"""
     models = await training_service.get_models()
     return ApiResponse(data=[ModelInfoResponse.model_validate(m).model_dump() for m in models])
 
 
 @router.delete("/models/{model_name}", response_model=ApiResponse)
-async def delete_model(model_name: str, current_user: User = Depends(get_current_user)):
+async def delete_model(model_name: str, current_user: User = Depends(require_admin)):
     """删除指定模型文件。"""
     ok = await training_service.delete_model(model_name)
     if not ok:

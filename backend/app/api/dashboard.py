@@ -40,6 +40,36 @@ logger = get_logger("dashboard")
 router = APIRouter(prefix="/api/dashboard", tags=["看板"])
 
 
+def _serialize_detection_task(
+    task: DetectionTask,
+    username: Optional[str] = None,
+    include_detections: bool = False,
+) -> dict:
+    """将检测任务转换为管理员监控接口使用的稳定字段。"""
+    scene = task.scene
+    payload = {
+        "id": task.id,
+        "task_uuid": task.task_uuid,
+        "user_id": task.user_id,
+        "username": username,
+        "scene_id": task.scene_id,
+        "scene_name": (scene.display_name or scene.name) if scene else None,
+        "status": task.status,
+        "total_objects": task.total_objects,
+        "inference_time": task.inference_time,
+        "image_url": task.image_url,
+        "error_message": task.error_message,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+    }
+    if include_detections:
+        payload.update({
+            "detections": task.detections or [],
+            "conf_threshold": task.conf_threshold,
+            "iou_threshold": task.iou_threshold,
+        })
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # GET /api/dashboard/overview  — 总览数据
 # ---------------------------------------------------------------------------
@@ -106,6 +136,88 @@ async def get_detection_stats(
     )
 
     return ApiResponse(code=200, message="success", data=stats.model_dump())
+
+
+# ---------------------------------------------------------------------------
+# GET /api/dashboard/detection/tasks  — 管理员检测任务列表
+# ---------------------------------------------------------------------------
+@router.get("/detection/tasks", response_model=ApiResponse)
+async def list_admin_detection_tasks(
+    page: int = Query(default=1, ge=1, description="页码"),
+    page_size: int = Query(default=20, ge=1, le=100, description="每页大小"),
+    task_status: Optional[str] = Query(default=None, alias="status", description="任务状态"),
+    user_id: Optional[int] = Query(default=None, description="提交用户 ID"),
+    scene_id: Optional[int] = Query(default=None, description="检测场景 ID"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """管理员分页查看全站检测任务，支持状态、用户和场景过滤。"""
+    logger.info(
+        f"管理员 {current_user.username} 查询全站检测任务 page={page}"
+    )
+    query = (
+        db.query(DetectionTask, User.username)
+        .outerjoin(User, DetectionTask.user_id == User.id)
+    )
+    if task_status:
+        query = query.filter(DetectionTask.status == task_status.strip().lower())
+    if user_id is not None:
+        query = query.filter(DetectionTask.user_id == user_id)
+    if scene_id is not None:
+        query = query.filter(DetectionTask.scene_id == scene_id)
+
+    total = query.count()
+    rows = (
+        query.order_by(DetectionTask.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return ApiResponse(
+        code=200,
+        message="success",
+        data={
+            "items": [
+                _serialize_detection_task(task, username)
+                for task, username in rows
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/dashboard/detection/tasks/{task_uuid}  — 管理员检测任务详情
+# ---------------------------------------------------------------------------
+@router.get("/detection/tasks/{task_uuid}", response_model=ApiResponse)
+async def get_admin_detection_task(
+    task_uuid: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """管理员查看任意检测任务的完整结果。"""
+    logger.info(
+        f"管理员 {current_user.username} 查询检测任务详情 uuid={task_uuid}"
+    )
+    row = (
+        db.query(DetectionTask, User.username)
+        .outerjoin(User, DetectionTask.user_id == User.id)
+        .filter(DetectionTask.task_uuid == task_uuid)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="检测任务不存在")
+
+    task, username = row
+    return ApiResponse(
+        code=200,
+        message="success",
+        data=_serialize_detection_task(
+            task, username, include_detections=True
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

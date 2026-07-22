@@ -2,17 +2,17 @@ export const trainingPreviewTasks = {
   data: {
     items: [
       {
-        task_uuid: 'train-7f2c9a', model_name: 'yolo11s', status: 'running', progress: 64,
+        task_uuid: 'train-7f2c9a', user_id: 18, model_name: 'yolo11s', status: 'running', progress: 64,
         data_yaml: '/datasets/uecfood256/data.yaml', epochs: 100, current_epoch: 64,
         img_size: 640, batch_size: 32, created_at: '2026-07-16T05:20:00Z', updated_at: '2026-07-16T08:42:00Z',
       },
       {
-        task_uuid: 'train-5a4b1d', model_name: 'yolo11n', status: 'completed', progress: 100,
+        task_uuid: 'train-5a4b1d', user_id: 7, model_name: 'yolo11n', status: 'completed', progress: 100,
         data_yaml: '/datasets/food101/data.yaml', epochs: 80, current_epoch: 80,
         img_size: 640, batch_size: 48, created_at: '2026-07-14T02:15:00Z', completed_at: '2026-07-14T09:30:00Z',
       },
       {
-        task_uuid: 'train-1d8e3f', model_name: 'yolo11m', status: 'paused', progress: 28,
+        task_uuid: 'train-1d8e3f', user_id: 12, model_name: 'yolo11m', status: 'paused', progress: 28,
         data_yaml: '/datasets/private/data.yaml', epochs: 120, current_epoch: 34,
         img_size: 768, batch_size: 16, created_at: '2026-07-13T03:05:00Z', updated_at: '2026-07-13T06:10:00Z',
       },
@@ -24,7 +24,7 @@ export const trainingPreviewTasks = {
 }
 
 export const trainingPreviewStats = {
-  data: { total: 86, completed: 61, failed: 8, running: 4, pending: 8, paused: 5 },
+  data: { total: 3, completed: 1, failed: 0, running: 1, pending: 0, paused: 1 },
 }
 
 export const trainingPreviewModels = {

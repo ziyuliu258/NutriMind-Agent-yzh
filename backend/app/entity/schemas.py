@@ -217,6 +217,7 @@ class TrainingTaskCreate(BaseModel):
 class TrainingTaskResponse(BaseModel):
     """训练任务响应"""
     id: int
+    user_id: Optional[int] = Field(default=None, description="提交用户 ID")
     task_uuid: str
     model_name: str
     status: str
