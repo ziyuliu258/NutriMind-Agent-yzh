@@ -379,4 +379,71 @@ class KnowledgeService:
             return {"total_chunks": 0, "sources": []}
 
 # 全局单例
+async def get_knowledge_graph(self) -> Dict[str, Any]:
+        """构建营养知识图谱（基于 food_nutrition 表）。
+        返回 nodes 和 edges 供前端可视化渲染。
+        """
+        try:
+            from sqlalchemy import create_engine, text
+            engine = create_engine(settings.DATABASE_URL)
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("SELECT * FROM food_nutrition ORDER BY category, food_name_cn")
+                ).fetchall()
+
+            nodes = []
+            edges = []
+            seen_cats = set()
+            nutrients = [
+                ("calories", "热量", "kcal"),
+                ("protein", "蛋白质", "g"),
+                ("fat", "脂肪", "g"),
+                ("carbs", "碳水化合物", "g"),
+                ("fiber", "膳食纤维", "g"),
+            ]
+            col_map = {"calories": 3, "protein": 4, "fat": 5, "carbs": 6, "fiber": 7}
+
+            for nid, nlabel, unit in nutrients:
+                nodes.append({
+                    "id": f"nut_{nid}", "label": nlabel,
+                    "type": "nutrient", "unit": unit, "group": "nutrient",
+                })
+
+            for row in rows:
+                fid = f"food_{row[0]}"
+                cat = row[11] or "未分类"
+                cid = f"cat_{cat}"
+
+                if cid not in seen_cats:
+                    nodes.append({
+                        "id": cid, "label": cat,
+                        "type": "category", "group": "category",
+                    })
+                    seen_cats.add(cid)
+
+                nodes.append({
+                    "id": fid, "label": row[2], "name_en": row[1],
+                    "type": "food", "group": "food",
+                    "category": cat,
+                    "calories": row[3], "protein": row[4],
+                    "fat": row[5], "carbs": row[6], "fiber": row[7],
+                })
+
+                edges.append({"source": fid, "target": cid, "relation": "BELONGS_TO"})
+
+                for nid, _, _ in nutrients:
+                    val = row[col_map[nid]]
+                    if val and val > 0:
+                        edges.append({
+                            "source": fid, "target": f"nut_{nid}",
+                            "relation": "HAS_NUTRIENT", "value": float(val),
+                        })
+
+            return {"nodes": nodes, "edges": edges}
+        except Exception as e:
+            logger.error(f"构建知识图谱失败: {e}")
+            return {"nodes": [], "edges": []}
+
+
+# 全局单例
 knowledge_service = KnowledgeService()

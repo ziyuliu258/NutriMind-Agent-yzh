@@ -139,3 +139,21 @@ async def get_knowledge_stats(
     except Exception as e:
         logger.error(f"获取知识库统计失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取统计失败: {str(e)}")
+<<<<<<< Updated upstream
+=======
+
+
+@router.get("/graph", response_model=ApiResponse)
+async def get_knowledge_graph(
+    current_user: User = Depends(get_current_user),
+):
+    """获取营养知识图谱（nodes + edges）。
+    基于 food_nutrition 表构建食物-分类-营养关系图，供前端可视化渲染。
+    """
+    try:
+        graph = await knowledge_service.get_knowledge_graph()
+        return ApiResponse(code=200, data=graph)
+    except Exception as e:
+        logger.error(f"获取知识图谱失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取图谱失败: {str(e)}")
+>>>>>>> Stashed changes
