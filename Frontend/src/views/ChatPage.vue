@@ -596,10 +596,8 @@ async function sendMessage() {
 
     const result = normalizeChatResponse(payload, sessionId.value)
     sessionId.value = result.sessionId || sessionId.value
-    if (!imageFile) {
-      activeSessionId.value = sessionId.value
-      sessionPersisted.value = true
-    }
+    activeSessionId.value = sessionId.value
+    sessionPersisted.value = true
     messages.value[responseIndex] = {
       role: 'assistant',
       content: result.response,
@@ -613,7 +611,7 @@ async function sendMessage() {
       ] : null,
     }
     scrollToEnd()
-    if (!imageFile) loadSessions(true)
+    loadSessions(true)
   } catch (error) {
     if (generation !== requestGeneration) return
     const errorMessage = requestErrorMessage(error, Boolean(imageFile))
