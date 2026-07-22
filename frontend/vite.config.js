@@ -33,4 +33,8 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
+  test: {
+    // 提供完整的 localStorage/sessionStorage，修复 Node 25 原生实现缺少 clear() 的问题。
+    setupFiles: ['./vitest.setup.js'],
+  },
 }))

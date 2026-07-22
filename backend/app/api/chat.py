@@ -16,9 +16,39 @@ from app.entity.schemas import (
     BoundingBox, ChatRequest, ChatResponse, ChatSessionCreate,
     ChatSessionResponse, ImageChatResponse,
 )
-from app.services.agent_graph import run_agent
+from app.services.agent_graph import run_agent, stream_agent
 from app.services import chat_service
 from app.services.image_store import image_store
+from app.services.knowledge_service import knowledge_service
+
+import asyncio
+from fastapi.responses import StreamingResponse
+from typing import AsyncIterator
+
+# 持有后台抽取任务引用，避免被 GC 提前回收
+_graph_tasks: set[asyncio.Task] = set()
+
+
+def _schedule_graph_extraction(user_message: str, response_text: str) -> None:
+    """对话结束后，后台从「用户消息 + 教练回复」抽取食物实体写入图谱。
+
+    fire-and-forget：不阻塞回复、不影响 SSE 流；失败只记日志。
+    """
+    combined = f"{user_message}\n\n{response_text}".strip()
+    if not combined:
+        return
+
+    async def _run():
+        try:
+            count = await knowledge_service.extract_and_store_graph(combined, source="对话抽取")
+            if count:
+                logger.info("对话图谱抽取：新增/更新 %d 种食物", count)
+        except Exception as exc:  # 后台任务绝不能影响主流程
+            logger.warning("对话图谱抽取失败，忽略: %s", exc)
+
+    task = asyncio.create_task(_run())
+    _graph_tasks.add(task)
+    task.add_done_callback(_graph_tasks.discard)
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +127,113 @@ async def _invoke_chat(
         except Exception as exc:
             db.rollback()
             logger.warning("保存智能体回复失败: %s", exc)
+
+    # 对话结束后后台抽取食物实体进图谱
+    _schedule_graph_extraction(message, result.get("response", ""))
+
     return ChatResponse(
         session_id=session_id,
         response=result["response"],
         tool_calls=result.get("tool_calls", []),
         analysis_result=result.get("analysis_result"),
     )
+
+
+def _sse(event: dict) -> str:
+    """把事件序列化为一条 SSE 记录。"""
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",  # 关闭 Nginx 缓冲，确保逐条下发
+}
+
+
+async def _stream_chat_events(
+    *,
+    session_id: str,
+    message: str,
+    thread_prefix: str,
+    user_id: int | None,
+    db: Session | None,
+    detections: list[dict] | None = None,
+    image_id: str | None = None,
+    extra_done: dict | None = None,
+) -> AsyncIterator[str]:
+    """驱动 stream_agent，逐条产出 SSE；结束时把最终回复持久化。"""
+    persisted_session = None
+    history = None
+    if db is not None and user_id is not None:
+        try:
+            persisted_session = chat_service.get_or_create_session(db, user_id, session_id, message)
+            history = chat_service.history_as_langchain(persisted_session)
+            chat_service.append_message(db, persisted_session, "user", message)
+        except Exception as exc:
+            db.rollback()
+            persisted_session = None
+            history = None
+            logger.warning("会话持久化暂不可用，降级为进程内对话: %s", exc)
+
+    # 先把 session_id 告知前端，便于新会话立即绑定
+    yield _sse({"type": "session", "session_id": session_id})
+
+    final_event: dict | None = None
+    try:
+        async for event in stream_agent(
+            session_id=f"{thread_prefix}:{session_id}",
+            user_message=message,
+            detections=detections,
+            image_id=image_id,
+            user_id=user_id,
+            history=history,
+            user_profile=_agent_profile(db, user_id),
+        ):
+            if event.get("type") == "done":
+                final_event = event
+                if extra_done:
+                    event = {**event, **extra_done}
+            yield _sse(event)
+    except Exception:
+        logger.exception("流式对话失败")
+        yield _sse({"type": "error", "message": "抱歉，营养分析暂时不可用，请稍后重试。"})
+        return
+
+    # 流正常结束：持久化助手回复
+    if persisted_session is not None and final_event is not None:
+        try:
+            chat_service.append_message(
+                db, persisted_session, "assistant",
+                final_event.get("response", ""), final_event.get("tool_calls", []),
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.warning("保存智能体回复失败: %s", exc)
+
+    # 对话结束后后台抽取食物实体进图谱
+    if final_event is not None:
+        _schedule_graph_extraction(message, final_event.get("response", ""))
+
+
+@router.post("/message/stream")
+async def send_message_stream(
+    request: ChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """流式发送消息（SSE）：智能体一边生成、前端一边显示，避免长请求超时。"""
+    message = _validate_request(request)
+    session_id = request.session_id or str(uuid.uuid4())
+    generator = _stream_chat_events(
+        session_id=session_id,
+        message=message,
+        thread_prefix=f"user:{current_user.id}",
+        user_id=current_user.id,
+        db=db,
+        detections=[item.model_dump() for item in request.detections] or None,
+    )
+    return StreamingResponse(generator, media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.post("/message", response_model=ChatResponse)
@@ -240,6 +371,36 @@ async def analyze_image(
         user_id=current_user.id,
         db=db,
     )
+
+
+@router.post("/image/stream")
+async def analyze_image_stream(
+    file: UploadFile = File(..., description="餐食图片（JPG/PNG/WEBP，最大 10MB）"),
+    message: str = Form(..., max_length=4000),
+    session_id: str | None = Form(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """流式图片对话（SSE）：Agent 调用真实 YOLO 工具，逐步回传分析结果。"""
+    if not message.strip():
+        raise HTTPException(status_code=422, detail="message 不能为空")
+    content = await file.read(settings.MAX_IMAGE_SIZE_MB * 1024 * 1024 + 1)
+    try:
+        image_id = await image_store.save(content=content, content_type=file.content_type or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    external_session_id = session_id or str(uuid.uuid4())
+    generator = _stream_chat_events(
+        session_id=external_session_id,
+        message=message.strip(),
+        thread_prefix=f"user:{current_user.id}:image",
+        user_id=current_user.id,
+        db=db,
+        image_id=image_id,
+        extra_done={"image_id": image_id},
+    )
+    return StreamingResponse(generator, media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @router.post("/image/mock", response_model=ImageChatResponse)

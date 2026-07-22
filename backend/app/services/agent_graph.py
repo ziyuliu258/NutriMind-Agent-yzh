@@ -18,7 +18,7 @@ Agent 图编排模块 — 使用 LangGraph 将 LLM 与工具节点连接。
 import json
 import logging
 import uuid
-from typing import Annotated, Any, Optional, TypedDict
+from typing import Annotated, Any, AsyncIterator, Optional, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -279,6 +279,27 @@ def _web_sources_from_tool_message(message: ToolMessage) -> list[dict]:
     return sources
 
 
+def _collect_tool_artifacts(name: str | None, content: Any) -> dict:
+    """从单个工具输出中提取图谱可用信息：联网来源、detect_food 检测结果。
+
+    流式与非流式共用。content 可能是 ToolMessage.content 字符串。
+    """
+    artifacts: dict = {"web_sources": [], "detections": [], "detection_mode": None}
+    text = content if isinstance(content, str) else getattr(content, "content", "")
+    if name == "detect_food":
+        try:
+            tool_result = json.loads(text)
+            if tool_result.get("success"):
+                artifacts["detections"] = tool_result.get("detections", [])
+                artifacts["detection_mode"] = tool_result.get("mode")
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("无法解析 detect_food 工具结果")
+    elif name in {"search_web_evidence", "search_nutrition_knowledge"}:
+        message = ToolMessage(content=text or "", tool_call_id="artifact", name=name)
+        artifacts["web_sources"] = _web_sources_from_tool_message(message)
+    return artifacts
+
+
 def _append_web_sources(response: str, sources: list[dict]) -> str:
     """确定性地把实际联网结果附在回答末尾，避免模型漏写或编造网址。"""
     unique = []
@@ -304,6 +325,71 @@ def _append_web_sources(response: str, sources: list[dict]) -> str:
 # ==================================================================
 # 公开入口
 # ==================================================================
+
+
+def _prepare_run(
+    *,
+    session_id: str,
+    user_message: str,
+    detections: Optional[list[dict]] = None,
+    image_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    history: Optional[list[BaseMessage]] = None,
+    user_profile: Optional[dict] = None,
+) -> Optional[tuple[AgentState, dict]]:
+    """构造 LangGraph 初始状态与运行配置（run_agent 与 stream_agent 共用）。
+
+    返回 (initial_state, config)；没有任何可用输入时返回 None。
+    """
+    messages = list(history or [])
+
+    # 图片只以安全 image_id 进入状态；由 Agent 自主决定并调用 detect_food。
+    if image_id:
+        messages.append(
+            HumanMessage(
+                content=(
+                    "[IMAGE_CONTEXT]\n"
+                    f"用户已上传一张餐食图片，image_id={image_id}。\n"
+                    "你必须先调用 detect_food 工具观察图片检测结果，不能猜测图片内容；"
+                    "得到食物列表后，再按用户问题决定是否查询和计算营养。"
+                )
+            )
+        )
+
+    # 兼容已有系统直接提供检测结果的场景
+    if detections:
+        detection_text = format_detection_for_prompt(detections)
+        context_msg = (
+            "YOLOv11 视觉模型检测到以下食物：\n\n"
+            f"{detection_text}\n\n"
+            "请查询这些食物的营养数据，计算总营养，并给出饮食建议。"
+        )
+        messages.append(HumanMessage(content=context_msg))
+
+    # 用户消息
+    if user_message:
+        messages.append(HumanMessage(content=user_message))
+
+    if not messages:
+        return None
+
+    # 数据库历史存在时，每次调用使用独立图线程，避免 MemorySaver 与持久化历史重复叠加。
+    thread_id = f"{session_id}:{uuid.uuid4()}" if history is not None else session_id
+    config = {
+        "configurable": {"thread_id": thread_id},
+        # 防止模型持续重复调用工具而形成无限循环。
+        "recursion_limit": 12,
+    }
+
+    initial_state: AgentState = {
+        "messages": messages,
+        "detections": detections,
+        "image_id": image_id,
+        "user_id": user_id,
+        "user_profile": user_profile,
+        "analysis_result": None,
+    }
+    return initial_state, config
 
 
 async def run_agent(
@@ -343,57 +429,13 @@ async def run_agent(
     """
     executor = _get_executor()
 
-    # 构造初始消息
-    messages = list(history or [])
-
-    # 图片只以安全 image_id 进入状态；由 Agent 自主决定并调用 detect_food。
-    if image_id:
-        messages.append(
-            HumanMessage(
-                content=(
-                    "[IMAGE_CONTEXT]\n"
-                    f"用户已上传一张餐食图片，image_id={image_id}。\n"
-                    "你必须先调用 detect_food 工具观察图片检测结果，不能猜测图片内容；"
-                    "得到食物列表后，再按用户问题决定是否查询和计算营养。"
-                )
-            )
-        )
-
-    # 兼容已有系统直接提供检测结果的场景
-    if detections:
-        detection_text = format_detection_for_prompt(detections)
-        context_msg = (
-            "YOLOv11 视觉模型检测到以下食物：\n\n"
-            f"{detection_text}\n\n"
-            "请查询这些食物的营养数据，计算总营养，并给出饮食建议。"
-        )
-        messages.append(HumanMessage(content=context_msg))
-
-    # 用户消息
-    if user_message:
-        messages.append(HumanMessage(content=user_message))
-
-    if not messages:
+    prepared = _prepare_run(
+        session_id=session_id, user_message=user_message, detections=detections,
+        image_id=image_id, user_id=user_id, history=history, user_profile=user_profile,
+    )
+    if prepared is None:
         return {"response": "未提供任何消息或检测结果。", "tool_calls": [], "analysis_result": None}
-
-    # 配置（session_id 作为 thread_id 用于内存检查点）
-    # 数据库历史存在时，每次调用使用独立图线程，避免 MemorySaver 与持久化历史重复叠加。
-    thread_id = f"{session_id}:{uuid.uuid4()}" if history is not None else session_id
-    config = {
-        "configurable": {"thread_id": thread_id},
-        # 防止模型持续重复调用工具而形成无限循环。
-        "recursion_limit": 12,
-    }
-
-    # 构建初始状态
-    initial_state: AgentState = {
-        "messages": messages,
-        "detections": detections,
-        "image_id": image_id,
-        "user_id": user_id,
-        "user_profile": user_profile,
-        "analysis_result": None,
-    }
+    initial_state, config = prepared
 
     try:
         # 执行图
@@ -460,3 +502,92 @@ async def run_agent(
             "detections": [],
             "detection_mode": None,
         }
+
+
+async def stream_agent(
+    session_id: str,
+    user_message: str,
+    detections: Optional[list[dict]] = None,
+    image_id: Optional[str] = None,
+    user_id: Optional[int] = None,
+    history: Optional[list[BaseMessage]] = None,
+    user_profile: Optional[dict] = None,
+) -> AsyncIterator[dict]:
+    """流式运行 Agent，逐步产出事件供 SSE 转发。
+
+    产出的事件类型：
+        {"type": "token", "text": "..."}         模型生成的文本片段（逐字）
+        {"type": "tool", "name": "..."}           开始调用某个工具
+        {"type": "reset"}                          清空前端已累积文本（工具调用前的内容非最终答案）
+        {"type": "done", "response", "tool_calls", "detections", "detection_mode"}
+        {"type": "error", "message": "..."}
+    """
+    executor = _get_executor()
+    prepared = _prepare_run(
+        session_id=session_id, user_message=user_message, detections=detections,
+        image_id=image_id, user_id=user_id, history=history, user_profile=user_profile,
+    )
+    if prepared is None:
+        yield {"type": "done", "response": "未提供任何消息或检测结果。",
+               "tool_calls": [], "detections": [], "detection_mode": None}
+        return
+    initial_state, config = prepared
+
+    final_text = ""            # 最后一段（最近一次工具调用之后）的模型文本 = 最终答案
+    tool_calls_log: list[dict] = []
+    web_sources: list[dict] = []
+    detected_foods: list[dict] = []
+    detection_mode: Optional[str] = None
+    streamed_any = False
+
+    user_token = agent_user_id.set(user_id or 0)
+    try:
+        async for event in executor.astream_events(initial_state, config, version="v2"):
+            kind = event.get("event")
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                text = getattr(chunk, "content", "") if chunk is not None else ""
+                if text:
+                    final_text += text
+                    streamed_any = True
+                    yield {"type": "token", "text": text}
+            elif kind == "on_tool_start":
+                name = event.get("name", "unknown")
+                tool_calls_log.append({"name": name, "args": event.get("data", {}).get("input", {})})
+                # 工具调用前若已输出文本，那不是最终答案 —— 让前端清空并重新累积
+                if final_text:
+                    final_text = ""
+                    yield {"type": "reset"}
+                yield {"type": "tool", "name": name}
+            elif kind == "on_tool_end":
+                name = event.get("name")
+                output = event.get("data", {}).get("output")
+                artifacts = _collect_tool_artifacts(name, output)
+                web_sources.extend(artifacts["web_sources"])
+                if artifacts["detections"]:
+                    detected_foods = artifacts["detections"]
+                    detection_mode = artifacts["detection_mode"]
+
+        response_text = _append_web_sources(final_text, web_sources)
+        if web_sources and not any(
+            call["name"] in {"search_web_evidence", "exa_web_search"}
+            for call in tool_calls_log
+        ):
+            tool_calls_log.append({
+                "name": "exa_web_search",
+                "args": {"source_count": len({source["url"] for source in web_sources})},
+            })
+        if not response_text:
+            response_text = "智能体已完成处理，但没有返回可显示的文字。"
+        yield {
+            "type": "done",
+            "response": response_text,
+            "tool_calls": tool_calls_log,
+            "detections": detected_foods,
+            "detection_mode": detection_mode,
+        }
+    except Exception:
+        logger.exception("Agent 流式执行失败")
+        yield {"type": "error", "message": "抱歉，营养分析暂时不可用，请稍后重试。"}
+    finally:
+        agent_user_id.reset(user_token)

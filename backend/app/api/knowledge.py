@@ -38,8 +38,10 @@ async def upload_document(
         tmp_path = tmp.name
 
     try:
-        # 3. 上传到知识库
-        chunks_count = await knowledge_service.embed_and_store(tmp_path, current_user.id)
+        # 3. 上传到知识库（向量入库 + 抽取食物实体入图谱）
+        result = await knowledge_service.embed_and_store(tmp_path, current_user.id)
+        chunks_count = result.get("chunks_count", 0)
+        foods_count = result.get("foods_count", 0)
         if chunks_count == 0:
             raise HTTPException(status_code=400, detail="文档处理失败，未生成有效内容")
 
@@ -49,7 +51,8 @@ async def upload_document(
             message="文档上传成功",
             data={
                 "filename": file.filename,
-                "chunks_count": chunks_count
+                "chunks_count": chunks_count,
+                "foods_count": foods_count
             }
         )
     finally:
@@ -152,3 +155,16 @@ async def get_knowledge_graph(
     except Exception as e:
         logger.error(f"获取知识图谱失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取图谱失败: {str(e)}")
+
+
+@router.post("/graph/rebuild", response_model=ApiResponse)
+async def rebuild_knowledge_graph(
+    current_user: User = Depends(get_current_user),
+):
+    """从已上传的知识库资料回填食物-营养图谱。"""
+    try:
+        result = await knowledge_service.rebuild_graph_from_knowledge(current_user.id)
+        return ApiResponse(code=200, message="知识图谱重建完成", data=result)
+    except Exception as e:
+        logger.exception("重建知识图谱失败")
+        raise HTTPException(status_code=500, detail=f"重建图谱失败: {str(e)}") from e

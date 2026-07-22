@@ -12,6 +12,19 @@
           历史对话
         </button>
         <button
+          class="stream-toggle"
+          type="button"
+          :disabled="generating"
+          :aria-pressed="streamingEnabled"
+          :aria-label="streamingEnabled ? '切换为经典模式' : '切换为流式输出'"
+          :title="streamingEnabled ? '当前：流式输出（逐字显示）' : '当前：经典模式（等待完整回复）'"
+          @click="toggleStreaming"
+        >
+          <Lightning v-if="streamingEnabled" :size="18" weight="fill" />
+          <ChatCircleDots v-else :size="18" weight="bold" />
+          {{ streamingEnabled ? '流式' : '经典' }}
+        </button>
+        <button
           class="context-toggle"
           type="button"
           :aria-pressed="contextHidden"
@@ -199,8 +212,8 @@ import {
 } from '@phosphor-icons/vue'
 import FuelButton from '@/components/ui/FuelButton.vue'
 import {
-  createChatSessionApi, deleteChatSessionApi, getChatSessionApi, getChatSessionsApi,
-  sendChatImageApi, sendChatMessageApi,
+  deleteChatSessionApi, getChatSessionApi, getChatSessionsApi,
+  sendChatImageApi, sendChatMessageApi, streamChatImageApi, streamChatMessageApi,
 } from '@/api/chat'
 import { getProfileApi } from '@/api/profile'
 import { useUserStore } from '@/stores/user'
@@ -218,6 +231,7 @@ const selectedImage = ref(null)
 const selectedImageUrl = ref('')
 const composerError = ref('')
 const contextHidden = ref(readContextPreference())
+const streamingEnabled = ref(readStreamingPreference())
 const sessionId = ref(createSessionId())
 const activeSessionId = ref('')
 const sessionPersisted = ref(false)
@@ -235,6 +249,7 @@ let requestGeneration = 0
 let activeRequestController = null
 let demoTimerId = null
 const CONTEXT_KEY = 'nutrimind_coach_context_hidden'
+const STREAMING_KEY = 'nutrimind_coach_streaming'
 const firstMessage = { role: 'assistant', content: '你好，我是 Nutri 教练。告诉我你的目标、训练安排或刚刚吃了什么。' }
 const messages = ref([{ ...firstMessage }])
 const demoSessions = [
@@ -319,6 +334,20 @@ function toggleContext() {
   contextHidden.value = !contextHidden.value
   try { localStorage.setItem(CONTEXT_KEY, String(contextHidden.value)) }
   catch { /* Keep the preference for this page session. */ }
+}
+
+function readStreamingPreference() {
+  // 默认开启流式；仅当用户显式切到经典模式时才关闭。
+  try { return localStorage.getItem(STREAMING_KEY) !== 'false' }
+  catch { return true }
+}
+
+function toggleStreaming() {
+  if (generating.value) return
+  streamingEnabled.value = !streamingEnabled.value
+  try { localStorage.setItem(STREAMING_KEY, String(streamingEnabled.value)) }
+  catch { /* Keep the preference for this page session. */ }
+  ElMessage.info(streamingEnabled.value ? '已切换为流式输出（逐字显示）' : '已切换为经典模式（等待完整回复）')
 }
 
 async function loadCoachContext() {
@@ -536,7 +565,9 @@ function requestErrorMessage(error, hasImage) {
   const status = error?.response?.status
   if (status === 413) return '图片超过服务端限制，请压缩后重新选择。'
   if (status === 422) return '问题或图片没有通过校验，请检查内容后重新发送。'
-  if (error?.code === 'ECONNABORTED') return '智能体处理时间较长，本次请求已超时，请稍后重试。'
+  if (error?.code === 'ECONNABORTED' || /idle timeout/.test(error?.message || '')) {
+    return '智能体处理时间较长，连接已中断，请稍后重试。'
+  }
   return hasImage ? '图片分析没有成功，请重新选择图片后再试。' : '消息没有发送成功，请稍后重新发送。'
 }
 
@@ -562,58 +593,100 @@ async function sendMessage() {
   const generation = ++requestGeneration
   const controller = new AbortController()
   activeRequestController = controller
+  let streamErrored = false
   try {
-    let payload
     if (userStore.isDemo) {
       await waitForDemo(controller.signal)
-      payload = demoResponse(Boolean(imageFile))
-    } else if (imageFile) {
-      payload = await sendChatImageApi(
-        imageFile,
-        { sessionId: sessionId.value, message: content },
-        { signal: controller.signal },
-      )
-    } else {
-      if (!sessionPersisted.value) {
-        try {
-          const created = normalizeChatSession(await createChatSessionApi(content.slice(0, 50), { signal: controller.signal }))
-          if (created.sessionId) {
-            sessionId.value = created.sessionId
-            activeSessionId.value = created.sessionId
-            sessionPersisted.value = true
-          }
-        } catch (error) {
-          if (controller.signal.aborted) throw error
-          // /chat/message can still auto-create the session and degrade gracefully if persistence is unavailable.
-        }
+      const payload = demoResponse(Boolean(imageFile))
+      if (generation !== requestGeneration) return
+      const result = normalizeChatResponse(payload, sessionId.value)
+      sessionId.value = result.sessionId || sessionId.value
+      if (!imageFile) { activeSessionId.value = sessionId.value; sessionPersisted.value = true }
+      messages.value[responseIndex] = {
+        role: 'assistant', content: result.response, detections: result.detections,
+        toolCalls: result.toolCalls, analysisResult: result.analysisResult,
+        nutrition: !imageFile ? [
+          { label: '预计热量', value: '520 kcal' },
+          { label: '蛋白质', value: '48g' },
+          { label: '碳水', value: '55g' },
+        ] : null,
       }
-      payload = await sendChatMessageApi(
-        { sessionId: sessionId.value, message: content },
-        { signal: controller.signal },
-      )
+      scrollToEnd()
+      return
+    }
+
+    const onEvent = (event) => {
+      if (generation !== requestGeneration) return
+      const msg = messages.value[responseIndex]
+      switch (event.type) {
+        case 'session':
+          if (event.session_id) {
+            sessionId.value = event.session_id
+            if (!imageFile) { activeSessionId.value = event.session_id; sessionPersisted.value = true }
+          }
+          break
+        case 'reset':
+          msg.pending = false
+          msg.content = ''
+          break
+        case 'token':
+          msg.pending = false
+          msg.content += event.text || ''
+          scrollToEnd()
+          break
+        case 'done': {
+          const result = normalizeChatResponse(event, sessionId.value)
+          messages.value[responseIndex] = {
+            role: 'assistant',
+            content: result.response,
+            detections: result.detections,
+            toolCalls: result.toolCalls,
+            analysisResult: result.analysisResult,
+          }
+          scrollToEnd()
+          break
+        }
+        case 'error':
+          streamErrored = true
+          messages.value[responseIndex] = {
+            role: 'assistant',
+            content: `**暂时没有得到回复**\n\n${event.message || '智能体处理失败，请稍后重试。'}`,
+            failed: true,
+          }
+          composerError.value = event.message || '智能体处理失败，请稍后重试。'
+          scrollToEnd()
+          break
+        default:
+          break
+      }
+    }
+
+    if (streamingEnabled.value) {
+      if (imageFile) {
+        await streamChatImageApi(imageFile, { sessionId: sessionId.value, message: content }, { signal: controller.signal, onEvent })
+      } else {
+        await streamChatMessageApi({ sessionId: sessionId.value, message: content }, { signal: controller.signal, onEvent })
+      }
+    } else {
+      // 经典模式：等待完整回复（超时更长 + 连接失败自动重试）
+      const payload = imageFile
+        ? await sendChatImageApi(imageFile, { sessionId: sessionId.value, message: content }, { signal: controller.signal })
+        : await sendChatMessageApi({ sessionId: sessionId.value, message: content }, { signal: controller.signal })
+      if (generation !== requestGeneration) return
+      const result = normalizeChatResponse(payload, sessionId.value)
+      sessionId.value = result.sessionId || sessionId.value
+      if (!imageFile) { activeSessionId.value = sessionId.value; sessionPersisted.value = true }
+      messages.value[responseIndex] = {
+        role: 'assistant',
+        content: result.response,
+        detections: result.detections,
+        toolCalls: result.toolCalls,
+        analysisResult: result.analysisResult,
+      }
+      scrollToEnd()
     }
     if (generation !== requestGeneration) return
-
-    const result = normalizeChatResponse(payload, sessionId.value)
-    sessionId.value = result.sessionId || sessionId.value
-    if (!imageFile) {
-      activeSessionId.value = sessionId.value
-      sessionPersisted.value = true
-    }
-    messages.value[responseIndex] = {
-      role: 'assistant',
-      content: result.response,
-      detections: result.detections,
-      toolCalls: result.toolCalls,
-      analysisResult: result.analysisResult,
-      nutrition: userStore.isDemo && !imageFile ? [
-        { label: '预计热量', value: '520 kcal' },
-        { label: '蛋白质', value: '48g' },
-        { label: '碳水', value: '55g' },
-      ] : null,
-    }
-    scrollToEnd()
-    if (!imageFile) loadSessions(true)
+    if (!imageFile && !streamErrored) loadSessions(true)
   } catch (error) {
     if (generation !== requestGeneration) return
     const errorMessage = requestErrorMessage(error, Boolean(imageFile))
@@ -664,10 +737,12 @@ onBeforeUnmount(() => {
 .page-head { margin-bottom: 24px; display: flex; align-items: end; justify-content: space-between; gap: 24px; }
 .page-head .status-chip { margin-bottom: 16px; }
 .page-actions { display: flex; align-items: center; gap: 9px; }
-.context-toggle, .history-toggle { min-height: 48px; padding: 0 14px; align-items: center; justify-content: center; gap: 8px; color: var(--text-secondary); background: transparent; border: 1px solid var(--border-strong); border-radius: 10px; font-size: .8rem; font-weight: 600; }
-.context-toggle { display: inline-flex; }
+.context-toggle, .history-toggle, .stream-toggle { min-height: 48px; padding: 0 14px; align-items: center; justify-content: center; gap: 8px; color: var(--text-secondary); background: transparent; border: 1px solid var(--border-strong); border-radius: 10px; font-size: .8rem; font-weight: 600; }
+.context-toggle, .stream-toggle { display: inline-flex; }
 .history-toggle { display: none; }
-.context-toggle:hover, .history-toggle:hover { color: var(--primary); background: var(--surface); border-color: rgba(159,226,75,.32); }
+.context-toggle:hover, .history-toggle:hover, .stream-toggle:hover:not(:disabled) { color: var(--primary); background: var(--surface); border-color: rgba(159,226,75,.32); }
+.stream-toggle[aria-pressed="true"] { color: var(--primary); border-color: rgba(159,226,75,.4); background: rgba(159,226,75,.08); }
+.stream-toggle:disabled { opacity: .5; cursor: not-allowed; }
 .chat-workspace { position: relative; height: max(680px, calc(100dvh - 220px)); display: grid; grid-template-columns: 240px minmax(0, 1fr) 290px; overflow: hidden; }
 .chat-workspace.context-hidden { grid-template-columns: 240px minmax(0, 1fr); }
 .context-hidden .context-panel { display: none; }

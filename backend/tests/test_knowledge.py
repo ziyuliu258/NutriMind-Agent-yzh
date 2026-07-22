@@ -212,6 +212,7 @@ class TestKnowledgeService:
         service = KnowledgeService()
         assert service is not None
         assert service._initialized == False
+        assert callable(service.get_knowledge_graph)
 
 
 class TestKnowledgeAPI:
@@ -271,6 +272,94 @@ def test_retrieval_uses_web_fallback_when_local_results_are_empty():
 
     assert result["used_web_fallback"] is True
     assert result["web_results"][0]["provider"] == "exa"
+
+
+class TestGraphEntityExtraction:
+    """测试上传文档时的“食物-营养-分类”实体抽取与入库。"""
+
+    def _service(self):
+        from app.services.knowledge_service import KnowledgeService
+        return KnowledgeService()
+
+    def test_parse_food_json_plain(self):
+        service = self._service()
+        raw = '{"foods": [{"name_cn": "苹果", "calories": 52}]}'
+        foods = service._parse_food_json(raw)
+        assert len(foods) == 1
+        assert foods[0]["name_cn"] == "苹果"
+
+    def test_parse_food_json_code_fence_and_noise(self):
+        service = self._service()
+        raw = "这是结果：\n```json\n{\"foods\": [{\"name_cn\": \"鸡胸肉\"}]}\n```\n完毕"
+        foods = service._parse_food_json(raw)
+        assert len(foods) == 1
+        assert foods[0]["name_cn"] == "鸡胸肉"
+
+    def test_parse_food_json_malformed_returns_empty(self):
+        service = self._service()
+        assert service._parse_food_json("模型抱歉，无法解析") == []
+        assert service._parse_food_json("") == []
+        assert service._parse_food_json(None) == []
+
+    def test_store_food_entities_dedup_and_backfill(self, db):
+        """upsert：新增有效条目、按名称去重、缺失分类可回填。"""
+        from unittest.mock import patch
+        from app.entity.db_models import FoodNutrition
+        from tests.conftest import test_engine
+
+        service = self._service()
+        foods = [
+            {"name_en": "apple", "name_cn": "苹果", "category": "水果",
+             "calories": 52, "protein": 0.3, "fat": 0.2, "carbs": 13.8, "fiber": 2.4},
+            {"name_en": "chicken breast", "name_cn": "鸡胸肉", "category": "肉蛋类",
+             "calories": 165, "protein": 31, "fat": 3.6, "carbs": 0, "fiber": 0},
+            {"name_cn": "", "calories": 100},          # 无中文名 → 跳过
+            {"name_cn": "神秘食物"},                     # 无热量 → 跳过
+        ]
+
+        with patch("sqlalchemy.create_engine", return_value=test_engine):
+            stored = service._store_food_entities(foods, "膳食指南.txt")
+            assert stored == 2
+            assert db.query(FoodNutrition).count() == 2
+
+            # 再次入库相同数据 → 不产生重复
+            stored_again = service._store_food_entities(foods, "膳食指南.txt")
+            assert stored_again == 0
+            assert db.query(FoodNutrition).count() == 2
+
+            # 回填分类：先造一条无分类记录，再用带分类数据补齐
+            db.add(FoodNutrition(
+                food_name="oats", food_name_cn="燕麦",
+                calories_per_100g=389.0, category=None,
+            ))
+            db.commit()
+            backfilled = service._store_food_entities(
+                [{"name_cn": "燕麦", "category": "谷物", "calories": 389}], "膳食指南.txt"
+            )
+            assert backfilled == 1
+            oats = db.query(FoodNutrition).filter_by(food_name_cn="燕麦").first()
+            assert oats.category == "谷物"
+
+    def test_extract_and_store_graph_flow(self, db):
+        """端到端（跳过真实 LLM）：抽取结果写入 food_nutrition。"""
+        from unittest.mock import patch
+        from app.entity.db_models import FoodNutrition
+        from tests.conftest import test_engine
+
+        service = self._service()
+        canned = [{"name_en": "banana", "name_cn": "香蕉", "category": "水果",
+                   "calories": 89, "protein": 1.1, "fat": 0.3, "carbs": 22.8, "fiber": 2.6}]
+
+        with patch.object(service, "_extract_food_entities", return_value=canned), \
+                patch("sqlalchemy.create_engine", return_value=test_engine):
+            count = asyncio.run(service.extract_and_store_graph("香蕉富含钾", source="水果.txt"))
+
+        assert count == 1
+        assert db.query(FoodNutrition).filter_by(food_name_cn="香蕉").count() == 1
+
+    def test_extract_and_store_graph_empty_text(self):
+        service = self._service()
+        assert asyncio.run(service.extract_and_store_graph("", source="x")) == 0
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -364,3 +365,122 @@ def test_agent_registers_knowledge_and_web_tools():
     tool_names = {tool.name for tool in agent_graph.AGENT_TOOLS}
     assert "search_nutrition_knowledge" in tool_names
     assert "search_web_evidence" in tool_names
+
+
+def test_conversation_extraction_uses_combined_text():
+    """对话结束后应把「用户消息 + 教练回复」一起送去抽取食物实体。"""
+    from app import api as _api  # noqa: F401
+    import app.api.chat as chat_api
+
+    async def _scenario():
+        captured = {}
+
+        async def _fake_extract(text, source=""):
+            captured["text"] = text
+            captured["source"] = source
+            return 2
+
+        with patch.object(chat_api.knowledge_service, "extract_and_store_graph", new=_fake_extract):
+            chat_api._schedule_graph_extraction("我今天吃了鸡胸肉", "鸡胸肉每100g蛋白质31g，很适合减脂。")
+            # 让后台任务跑完
+            await asyncio.sleep(0)
+            while chat_api._graph_tasks:
+                await asyncio.gather(*list(chat_api._graph_tasks))
+        return captured
+
+    captured = asyncio.run(_scenario())
+    assert "鸡胸肉" in captured["text"]
+    assert "蛋白质31g" in captured["text"]
+    assert captured["source"] == "对话抽取"
+
+
+def test_conversation_extraction_skips_empty_text():
+    import app.api.chat as chat_api
+
+    async def _scenario():
+        called = {"n": 0}
+
+        async def _fake_extract(text, source=""):
+            called["n"] += 1
+            return 0
+
+        with patch.object(chat_api.knowledge_service, "extract_and_store_graph", new=_fake_extract):
+            chat_api._schedule_graph_extraction("", "")
+            await asyncio.sleep(0)
+        return called
+
+    assert asyncio.run(_scenario())["n"] == 0
+
+
+def _parse_sse(body: str) -> list[dict]:
+    """从 SSE 响应体解析出事件列表。"""
+    events = []
+    for frame in body.split("\n\n"):
+        line = frame.strip()
+        if line.startswith("data:"):
+            events.append(json.loads(line[len("data:"):].strip()))
+    return events
+
+
+def test_message_stream_endpoint_emits_sse_events():
+    app.dependency_overrides[get_current_user] = _mock_user
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {"type": "token", "text": "你好"}
+        yield {"type": "tool", "name": "query_food_calories"}
+        yield {"type": "reset"}
+        yield {"type": "token", "text": "这餐约 250 kcal。"}
+        yield {"type": "done", "response": "这餐约 250 kcal。",
+               "tool_calls": [{"name": "query_food_calories", "args": {}}],
+               "detections": [], "detection_mode": None}
+
+    try:
+        with patch("app.api.chat.stream_agent", new=_fake_stream):
+            with TestClient(app).stream(
+                "POST", "/api/chat/message/stream",
+                json={"session_id": "meal-1", "message": "分析一下"},
+            ) as response:
+                assert response.status_code == 200
+                assert response.headers["content-type"].startswith("text/event-stream")
+                body = "".join(response.iter_text())
+    finally:
+        app.dependency_overrides.clear()
+
+    events = _parse_sse(body)
+    types = [event["type"] for event in events]
+    assert types[0] == "session"
+    assert "token" in types and "done" in types
+    done = next(event for event in events if event["type"] == "done")
+    assert done["response"] == "这餐约 250 kcal。"
+    assert done["tool_calls"][0]["name"] == "query_food_calories"
+
+
+def test_stream_agent_maps_events_and_appends_web_sources():
+    class _FakeExecutor:
+        async def astream_events(self, _state, _config, version=None):
+            yield {"event": "on_chat_model_stream",
+                   "data": {"chunk": AIMessage(content="部分")}}
+            yield {"event": "on_tool_start", "name": "search_web_evidence",
+                   "data": {"input": {"query": "diet"}}}
+            yield {"event": "on_tool_end", "name": "search_web_evidence",
+                   "data": {"output": ToolMessage(
+                       content='{"results":[{"title":"WHO","url":"https://who.int/x","provider":"exa"}]}',
+                       tool_call_id="w1", name="search_web_evidence")}}
+            yield {"event": "on_chat_model_stream",
+                   "data": {"chunk": AIMessage(content="最终答案")}}
+
+    with patch("app.services.agent_graph._get_executor", return_value=_FakeExecutor()):
+        async def _collect():
+            return [event async for event in agent_graph.stream_agent(
+                session_id="s1", user_message="健康饮食", user_id=1,
+            )]
+        events = asyncio.run(_collect())
+
+    types = [event["type"] for event in events]
+    # 工具调用前的“部分”文本被 reset 清除，最终只保留“最终答案”并附上联网来源
+    assert "reset" in types
+    done = next(event for event in events if event["type"] == "done")
+    assert "最终答案" in done["response"]
+    assert "### 联网来源" in done["response"]
+    assert "https://who.int/x" in done["response"]
+    assert any(call["name"] in {"search_web_evidence", "exa_web_search"} for call in done["tool_calls"])

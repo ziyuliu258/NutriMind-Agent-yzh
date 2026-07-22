@@ -2,7 +2,7 @@ import os
 import tempfile
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from sqlalchemy import text
 
 from app.config.settings import settings
@@ -167,19 +167,24 @@ class KnowledgeService:
             logger.error(f"文档分块失败: {e}")
             return []
 
-    async def embed_and_store(self, file_path: str, user_id: int = 0) -> int:
-        """加载、分块、向量化并存储文档"""
+    async def embed_and_store(self, file_path: str, user_id: int = 0) -> Dict[str, int]:
+        """加载、分块、向量化并存储文档。
+
+        返回 {"chunks_count": 向量分块数, "foods_count": 抽取入图谱的食物数}。
+        文档入向量库后，会额外抽取“食物-营养-分类”实体写入 food_nutrition，
+        使上传的资料自动出现在营养知识图谱中。抽取失败不影响向量入库。
+        """
         try:
             self._initialize()
             # 加载文档（同步操作，放在线程池执行）
             import asyncio
             documents = await asyncio.to_thread(self.load_document, file_path)
             if not documents:
-                return 0
+                return {"chunks_count": 0, "foods_count": 0}
 
             chunks = await asyncio.to_thread(self.split_document, documents)
             if not chunks:
-                return 0
+                return {"chunks_count": 0, "foods_count": 0}
 
             # 添加元数据（含 user_id 用于用户隔离）
             for chunk in chunks:
@@ -190,10 +195,222 @@ class KnowledgeService:
             # 存储到向量库（add_documents 是同步方法，但可能耗时）
             await asyncio.to_thread(self.vector_store.add_documents, chunks)
             logger.info(f"文档存储完成: {file_path}, 块数={len(chunks)}")
-            return len(chunks)
+
+            # 从文档正文抽取食物实体并写入图谱数据表（best-effort，失败不影响上传）
+            foods_count = 0
+            try:
+                full_text = "\n".join(doc.page_content for doc in documents)
+                foods_count = await self.extract_and_store_graph(
+                    full_text, source=Path(file_path).name
+                )
+            except Exception as exc:
+                logger.warning("图谱实体抽取失败，不影响文档入库: %s", exc)
+
+            return {"chunks_count": len(chunks), "foods_count": foods_count}
         except Exception as e:
             logger.error(f"向量化存储失败: {e}")
+            return {"chunks_count": 0, "foods_count": 0}
+
+    # 抽取正文时最多送入模型的字符数，控制单次调用成本与延迟
+    _EXTRACT_MAX_CHARS = 6000
+    # 单次回填处理的资料上限，避免一次请求意外产生过多模型调用
+    _REBUILD_MAX_SOURCES = 24
+
+    async def extract_and_store_graph(self, text: str, source: str = "") -> int:
+        """从文档正文抽取食物营养实体，并写入 food_nutrition 图谱数据表。
+
+        返回新增/更新的食物条目数量。抽取由大模型完成，仅提取文中明确
+        提及、且带营养语境的食物，避免臆造数据。
+        """
+        import asyncio
+
+        if not text or not text.strip():
             return 0
+        foods = await asyncio.to_thread(self._extract_food_entities, text[: self._EXTRACT_MAX_CHARS])
+        if not foods:
+            return 0
+        return await asyncio.to_thread(self._store_food_entities, foods, source)
+
+    async def rebuild_graph_from_knowledge(self, user_id: int = 0) -> Dict[str, int]:
+        """从已入库的向量文档回填营养图谱。
+
+        这用于处理功能上线前已经上传的资料。向量表按资料名聚合后，
+        每份资料只调用一次实体抽取，避免对每个分块重复调用模型。
+        """
+        import asyncio
+
+        source_texts = await asyncio.to_thread(self._load_graph_source_texts, user_id)
+        processed_sources = 0
+        foods_count = 0
+        for source, text in source_texts[: self._REBUILD_MAX_SOURCES]:
+            foods_count += await self.extract_and_store_graph(text, source=source)
+            processed_sources += 1
+
+        logger.info(
+            "知识库图谱回填完成：资料=%d，新增/更新食物=%d",
+            processed_sources,
+            foods_count,
+        )
+        return {"processed_sources": processed_sources, "foods_count": foods_count}
+
+    @staticmethod
+    def _load_graph_source_texts(user_id: int = 0) -> List[Tuple[str, str]]:
+        """按资料聚合 PgVector 中的文档正文，供图谱回填使用。"""
+        from sqlalchemy import create_engine, text
+
+        engine = create_engine(settings.DATABASE_URL)
+        query = text(
+            "SELECT document, "
+            "COALESCE(cmetadata->>'file_name', cmetadata->>'source', '知识库文档') "
+            "AS source_name "
+            "FROM langchain_pg_embedding "
+            "WHERE (:include_all OR cmetadata->>'user_id' = :user_id) "
+            "ORDER BY source_name"
+        )
+        grouped: Dict[str, List[str]] = {}
+        with engine.connect() as conn:
+            rows = conn.execute(
+                query,
+                {"include_all": user_id == 0, "user_id": str(user_id)},
+            ).fetchall()
+        for document, source_name in rows:
+            if not document:
+                continue
+            source = str(source_name or "知识库文档")
+            grouped.setdefault(source, []).append(str(document))
+        return [(source, "\n".join(chunks)) for source, chunks in grouped.items()]
+
+    def _extract_food_entities(self, text: str) -> List[Dict[str, Any]]:
+        """调用大模型，从文本抽取结构化食物营养实体（每 100g）。"""
+        from langchain_openai import ChatOpenAI
+
+        llm = ChatOpenAI(
+            model=settings.OPENAI_MODEL,
+            openai_api_key=settings.OPENAI_API_KEY,
+            openai_api_base=settings.OPENAI_BASE_URL,
+            temperature=0,
+            max_tokens=1500,
+        )
+        prompt = (
+            "你是营养知识图谱抽取器。从下面的资料中提取被明确讨论、且带营养语境的食物，"
+            "为每种食物给出【每 100g】的营养数据。严格要求：\n"
+            "1. 只提取资料中真实出现的食物，不要臆造；资料未涉及食物时返回空数组。\n"
+            "2. 所有营养数值必须是【每 100g】的标准值，单位固定为 kcal 或 g：\n"
+            "   - 资料给的是某个份量的总量时（如『200g 鸡胸肉含蛋白质 62g』），"
+            "必须换算回每 100g（62÷200×100=31），绝不直接照抄份量总量。\n"
+            "   - 资料本身就是每 100g 值时，直接使用。\n"
+            "   - 资料没给数值时，用该食物公认的每 100g 标准值；无法确定的字段填 null，绝不编造。\n"
+            "3. category 用简体中文大类：水果/蔬菜/肉蛋类/谷物/豆类/坚果/乳制品/水产/主食/其他。\n"
+            "4. 只返回 JSON，不要解释、不要代码块围栏。所有数值均为每 100g，格式：\n"
+            '{"foods": [{"name_en": "apple", "name_cn": "苹果", "category": "水果", '
+            '"calories": 52, "protein": 0.3, "fat": 0.2, "carbs": 13.8, "fiber": 2.4}]}\n\n'
+            "资料：\n" + text
+        )
+        try:
+            response = llm.invoke(prompt)
+            raw = response.content if hasattr(response, "content") else str(response)
+            foods = self._parse_food_json(raw)
+            logger.info("图谱实体抽取完成：识别食物 %d 种", len(foods))
+            return foods
+        except Exception as exc:
+            logger.warning("食物实体抽取调用失败: %s", exc)
+            return []
+
+    @staticmethod
+    def _parse_food_json(raw: str) -> List[Dict[str, Any]]:
+        """稳健解析模型返回的 JSON（容忍代码块围栏与前后噪声）。"""
+        import json
+        import re
+
+        if not raw or not isinstance(raw, str):
+            return []
+        cleaned = raw.strip()
+        # 去掉 ```json ... ``` 围栏
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+        # 截取最外层 JSON 对象
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start : end + 1]
+        try:
+            data = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        foods = data.get("foods") if isinstance(data, dict) else data
+        return foods if isinstance(foods, list) else []
+
+    def _store_food_entities(self, foods: List[Dict[str, Any]], source: str) -> int:
+        """将抽取到的食物实体去重后 upsert 进 food_nutrition。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.entity.db_models import FoodNutrition
+
+        def _num(value):
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return None
+            return num if num >= 0 else None
+
+        engine = create_engine(settings.DATABASE_URL)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        stored = 0
+        try:
+            for item in foods:
+                if not isinstance(item, dict):
+                    continue
+                name_cn = str(item.get("name_cn") or "").strip()
+                name_en = str(item.get("name_en") or "").strip().lower()
+                if not name_cn and not name_en:
+                    continue
+                calories = _num(item.get("calories"))
+                # 无中文名或无热量的条目信息量不足，跳过（热量是图谱主营养边）
+                if not name_cn or calories is None:
+                    continue
+
+                existing = (
+                    db.query(FoodNutrition)
+                    .filter(
+                        (FoodNutrition.food_name_cn == name_cn)
+                        | ((FoodNutrition.food_name == name_en) & (name_en != ""))
+                    )
+                    .first()
+                )
+                category = str(item.get("category") or "").strip() or None
+                protein = _num(item.get("protein")) or 0.0
+                fat = _num(item.get("fat")) or 0.0
+                carbs = _num(item.get("carbs")) or 0.0
+                fiber = _num(item.get("fiber")) or 0.0
+
+                if existing is None:
+                    db.add(FoodNutrition(
+                        food_name=name_en or name_cn,
+                        food_name_cn=name_cn,
+                        calories_per_100g=calories,
+                        protein_per_100g=protein,
+                        fat_per_100g=fat,
+                        carbs_per_100g=carbs,
+                        fiber_per_100g=fiber,
+                        category=category,
+                        source=source or "知识库抽取",
+                    ))
+                    stored += 1
+                else:
+                    # 只补齐缺失的分类，避免覆盖已有的可信数据
+                    if category and not existing.category:
+                        existing.category = category
+                        stored += 1
+            db.commit()
+            logger.info("图谱食物入库完成：新增/更新 %d 条（来源=%s）", stored, source)
+            return stored
+        except Exception as exc:
+            db.rollback()
+            logger.error("图谱食物入库失败: %s", exc)
+            return 0
+        finally:
+            db.close()
 
     async def search(self, query: str, k: int = 5, user_id: int = 0) -> List[Dict[str, Any]]:
         """语义检索（可选按用户过滤）。"""
@@ -378,8 +595,7 @@ class KnowledgeService:
             logger.error(f"获取统计信息失败: {e}")
             return {"total_chunks": 0, "sources": []}
 
-# 全局单例
-async def get_knowledge_graph(self) -> Dict[str, Any]:
+    async def get_knowledge_graph(self) -> Dict[str, Any]:
         """构建营养知识图谱（基于 food_nutrition 表）。
         返回 nodes 和 edges 供前端可视化渲染。
         """
