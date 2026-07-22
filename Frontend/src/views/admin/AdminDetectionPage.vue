@@ -155,8 +155,8 @@
         <span class="scope-icon"><ShieldCheck :size="24" weight="duotone" /></span>
         <div>
           <span>数据范围</span>
-          <h2 id="scope-title" class="section-title">聚合监控与只读任务历史</h2>
-          <p>上方统计用于观察整体负载，下方历史由检测任务接口提供真实任务编号和结果详情；当前页面只读取任务，不提供文档之外的取消、重跑或删除操作。</p>
+          <h2 id="scope-title" class="section-title">全站聚合监控与全站任务历史</h2>
+          <p>上方统计与下方历史均覆盖全站检测任务；页面只读取数据，不提供取消、重跑或删除操作。</p>
         </div>
       </section>
     </template>
@@ -165,8 +165,8 @@
       <header class="history-heading">
         <div>
           <span>Task history</span>
-          <h2 id="detection-history-title" class="section-title">检测任务历史</h2>
-          <p>查看后端保存的检测任务、处理状态与识别结果。</p>
+          <h2 id="detection-history-title" class="section-title">全部检测任务历史</h2>
+          <p>查看所有用户提交的检测任务、处理状态与识别结果。</p>
         </div>
         <button type="button" :disabled="taskLoading" aria-label="刷新检测任务历史" @click="loadTasks">
           <ArrowsClockwise :class="{ spin: taskLoading }" :size="18" />
@@ -185,12 +185,13 @@
       <template v-else>
         <div class="history-table">
           <table>
-            <thead><tr><th>任务编号</th><th>状态</th><th>场景</th><th>检测目标</th><th>推理耗时</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
+            <thead><tr><th>任务编号</th><th>状态</th><th>提交账号</th><th>场景</th><th>检测目标</th><th>推理耗时</th><th>创建时间</th><th><span class="sr-only">操作</span></th></tr></thead>
             <tbody>
               <tr v-for="task in tasks" :key="task.uuid">
                 <td><span class="task-id" :title="task.uuid || ''">{{ task.uuid || '--' }}</span></td>
                 <td><span class="task-status" :class="taskStatusMeta(task.status).tone"><i />{{ taskStatusMeta(task.status).label }}</span></td>
-                <td>{{ task.sceneName || (task.sceneId ? `场景 ${task.sceneId}` : '--') }}</td>
+                <td>{{ taskOwnerLabel(task) }}</td>
+                <td>{{ taskSceneLabel(task) }}</td>
                 <td>{{ formatMetric(task.totalObjects) }}</td>
                 <td>{{ formatSeconds(task.inferenceTime) }}</td>
                 <td><time :datetime="task.createdAt || undefined">{{ formatTaskDate(task.createdAt) }}</time></td>
@@ -204,7 +205,7 @@
           <article v-for="task in tasks" :key="task.uuid">
             <header><span class="task-status" :class="taskStatusMeta(task.status).tone"><i />{{ taskStatusMeta(task.status).label }}</span><time :datetime="task.createdAt || undefined">{{ formatTaskDate(task.createdAt) }}</time></header>
             <b :title="task.uuid || ''">{{ task.uuid || '任务编号未知' }}</b>
-            <dl><div><dt>场景</dt><dd>{{ task.sceneName || '--' }}</dd></div><div><dt>目标数</dt><dd>{{ formatMetric(task.totalObjects) }}</dd></div><div><dt>推理耗时</dt><dd>{{ formatSeconds(task.inferenceTime) }}</dd></div></dl>
+            <dl><div><dt>提交账号</dt><dd>{{ taskOwnerLabel(task) }}</dd></div><div><dt>场景</dt><dd>{{ taskSceneLabel(task) }}</dd></div><div><dt>目标数</dt><dd>{{ formatMetric(task.totalObjects) }}</dd></div><div><dt>推理耗时</dt><dd>{{ formatSeconds(task.inferenceTime) }}</dd></div></dl>
             <button class="detail-action" type="button" :disabled="!task.uuid" @click="openTaskDetail(task)"><Eye :size="17" />查看详情</button>
           </article>
         </div>
@@ -223,9 +224,9 @@
       <template v-else-if="selectedTask">
         <section class="task-detail-summary">
           <span class="task-status" :class="taskStatusMeta(selectedTask.status).tone"><i />{{ taskStatusMeta(selectedTask.status).label }}</span>
-          <h3>{{ selectedTask.sceneName || '未命名检测场景' }}</h3>
+          <h3>{{ taskSceneLabel(selectedTask, '未提供检测场景') }}</h3>
           <p>{{ selectedTask.uuid || '--' }}</p>
-          <dl><div><dt>检测目标</dt><dd>{{ formatMetric(selectedTask.totalObjects) }}</dd></div><div><dt>推理耗时</dt><dd>{{ formatSeconds(selectedTask.inferenceTime) }}</dd></div><div><dt>创建时间</dt><dd>{{ formatTaskDate(selectedTask.createdAt) }}</dd></div><div><dt>完成时间</dt><dd>{{ formatTaskDate(selectedTask.completedAt || selectedTask.updatedAt) }}</dd></div></dl>
+          <dl><div><dt>提交账号</dt><dd>{{ taskOwnerLabel(selectedTask) }}</dd></div><div><dt>检测目标</dt><dd>{{ formatMetric(selectedTask.totalObjects) }}</dd></div><div><dt>推理耗时</dt><dd>{{ formatSeconds(selectedTask.inferenceTime) }}</dd></div><div><dt>创建时间</dt><dd>{{ formatTaskDate(selectedTask.createdAt) }}</dd></div><div v-if="selectedTask.completedAt || selectedTask.updatedAt"><dt>完成时间</dt><dd>{{ formatTaskDate(selectedTask.completedAt || selectedTask.updatedAt) }}</dd></div></dl>
         </section>
         <img v-if="selectedTask.imageUrl" class="task-image" :src="selectedTask.imageUrl" alt="检测任务原始图片">
         <p v-if="selectedTask.errorMessage" class="task-detail-error" role="alert"><WarningOctagon :size="18" />{{ selectedTask.errorMessage }}</p>
@@ -253,8 +254,8 @@ import {
   PhShieldCheck as ShieldCheck, PhTarget as Target, PhTimer as Timer,
   PhWarningCircle as WarningCircle, PhWarningOctagon as WarningOctagon,
 } from '@phosphor-icons/vue'
-import { getDetectionTaskDetailApi, getDetectionTasksApi } from '@/api/detection'
 import {
+  getAdminDetectionTaskDetailApi, getAdminDetectionTasksApi,
   getDetectionStatsApi, getDetectionStatusDistributionApi,
 } from '@/api/dashboard'
 import { useUserStore } from '@/stores/user'
@@ -409,6 +410,42 @@ function taskStatusMeta(status) {
   })[status] || { label: status || '未知', tone: 'unknown' }
 }
 
+function taskSceneLabel(task, fallback = '--') {
+  if (task?.sceneName) return task.sceneName
+  if (task?.sceneId !== null && task?.sceneId !== undefined && task?.sceneId !== '') return `场景 ${task.sceneId}`
+  return fallback
+}
+
+function taskOwnerLabel(task) {
+  if (task?.username) return task.username
+  if (task?.userId !== null && task?.userId !== undefined && task?.userId !== '') return `用户 ${task.userId}`
+  return '系统任务'
+}
+
+function mergeTaskDetail(summary, detail) {
+  const original = summary || {}
+  return {
+    ...original,
+    ...detail,
+    uuid: detail.uuid || original.uuid || null,
+    status: detail.status && detail.status !== 'unknown' ? detail.status : original.status,
+    userId: detail.userId ?? original.userId ?? null,
+    username: detail.username || original.username || '',
+    sceneName: detail.sceneName || original.sceneName || '',
+    sceneId: detail.sceneId ?? original.sceneId ?? null,
+    fileName: detail.fileName || original.fileName || '',
+    imageUrl: detail.imageUrl || original.imageUrl || '',
+    totalObjects: detail.totalObjects ?? original.totalObjects ?? null,
+    inferenceTime: detail.inferenceTime ?? original.inferenceTime ?? null,
+    confThreshold: detail.confThreshold ?? original.confThreshold ?? null,
+    iouThreshold: detail.iouThreshold ?? original.iouThreshold ?? null,
+    errorMessage: detail.errorMessage || original.errorMessage || '',
+    createdAt: detail.createdAt || original.createdAt || null,
+    updatedAt: detail.updatedAt || original.updatedAt || null,
+    completedAt: detail.completedAt || original.completedAt || null,
+  }
+}
+
 async function loadDetection() {
   if (isPreviewMode.value) {
     await applyPreviewState()
@@ -462,7 +499,7 @@ async function loadTasks() {
   taskLoading.value = true
   taskError.value = ''
   try {
-    const normalized = normalizeDetectionTaskList(await getDetectionTasksApi({
+    const normalized = normalizeDetectionTaskList(await getAdminDetectionTasksApi({
       page: taskPage.value, page_size: taskPageSize,
     }, { silent: true }))
     tasks.value = normalized.items
@@ -492,7 +529,8 @@ async function loadTaskDetail(uuid) {
   taskDetailLoading.value = true
   taskDetailError.value = ''
   try {
-    selectedTask.value = normalizeDetectionTaskDetail(await getDetectionTaskDetailApi(uuid, { silent: true }))
+    const detail = normalizeDetectionTaskDetail(await getAdminDetectionTaskDetailApi(uuid, { silent: true }))
+    selectedTask.value = mergeTaskDetail(selectedTask.value, detail)
   } catch {
     taskDetailError.value = '检测任务详情暂时无法读取，请稍后重试。'
   } finally {
@@ -737,7 +775,7 @@ onMounted(refreshAll)
   .history-cards article > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
   .history-cards time { color: var(--muted); font-size: .62rem; }
   .history-cards article > b { margin-top: 12px; display: block; overflow: hidden; color: var(--text); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
-  .history-cards dl { margin: 13px 0; display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; }
+  .history-cards dl { margin: 13px 0; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 9px; }
   .history-cards dl div { display: grid; gap: 3px; }
   .history-cards dt { color: var(--muted); font-size: .58rem; }
   .history-cards dd { margin: 0; color: var(--text-secondary); font-size: .67rem; }

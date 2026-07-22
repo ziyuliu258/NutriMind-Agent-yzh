@@ -68,6 +68,8 @@ export function normalizeDetectionTask(source = {}) {
 
   return {
     uuid: source.task_uuid ?? source.uuid ?? source.id ?? normalizedResult.taskUuid ?? null,
+    userId: source.user_id ?? source.owner_id ?? null,
+    username: text(source.username ?? source.user_name ?? source.owner_name),
     status,
     sceneName: text(source.scene_name_cn ?? source.scene_name ?? scene.name_cn ?? scene.name),
     sceneId: source.scene_id ?? scene.id ?? null,
@@ -75,6 +77,8 @@ export function normalizeDetectionTask(source = {}) {
     imageUrl: text(source.image_url ?? source.original_image_url ?? source.result_image_url),
     totalObjects: numberOrNull(source.total_objects ?? source.detection_count) ?? normalizedResult.totalObjects,
     inferenceTime: numberOrNull(source.inference_time) ?? normalizedResult.inferenceTime,
+    confThreshold: numberOrNull(source.conf_threshold),
+    iouThreshold: numberOrNull(source.iou_threshold),
     detections: normalizedResult.detections,
     errorMessage: text(source.error_message ?? source.error ?? source.detail),
     createdAt: source.created_at || null,
