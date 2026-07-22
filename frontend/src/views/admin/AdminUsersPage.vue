@@ -12,7 +12,7 @@
       <div>
         <span class="status-chip"><Users :size="16" weight="bold" /> User Management API</span>
         <h1 class="page-title">账户清晰，权限可控。</h1>
-        <p class="page-description">检索用户、查看账户详情，并维护启用状态、管理员身份和角色。</p>
+        <p class="page-description">检索用户、查看账户详情，并维护启用状态、管理员身份和业务角色。</p>
       </div>
       <button class="primary-action" type="button" :disabled="loading" @click="loadUsers">
         <CircleNotch v-if="loading" class="spin" :size="18" weight="bold" />
@@ -178,7 +178,7 @@
         <label class="role-editor">
           <span>角色名称</span>
           <textarea v-model="editRoles" rows="4" placeholder="例如：admin, nutrition_editor" />
-          <small>使用逗号分隔。保存后将完整替换该用户现有角色；当前接口没有提供可选角色字典。</small>
+          <small>使用逗号分隔，保存后将完整替换现有角色。业务角色不会授予管理后台权限，管理员身份以上方开关为准；当前接口未提供可选角色字典。</small>
         </label>
         <p v-if="permissionError" class="inline-error" role="alert"><WarningCircle :size="17" />{{ permissionError }}</p>
       </div>

@@ -23,6 +23,7 @@ export function normalizeTrainingTask(source = {}) {
   const progress = numberOrNull(source.progress ?? source.progress_percent)
   return {
     uuid: source.task_uuid ?? source.uuid ?? source.id ?? null,
+    userId: source.user_id ?? source.owner_id ?? null,
     modelName: text(source.model_name ?? config.model_name),
     status: text(source.status).toLowerCase() || 'unknown',
     progress: progress === null ? null : Math.min(100, Math.max(0, progress)),

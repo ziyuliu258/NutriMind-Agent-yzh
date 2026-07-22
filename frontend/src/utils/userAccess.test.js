@@ -15,6 +15,12 @@ describe('role-based frontend access', () => {
     expect(getDefaultRouteForUser(user)).toBe('/app/coach')
   })
 
+  it('does not grant administrator access from a display role alone', () => {
+    const user = { is_superuser: false, roles: ['admin'] }
+    expect(isAdminUser(user)).toBe(false)
+    expect(getDefaultRouteForUser(user)).toBe('/app/coach')
+  })
+
   it('treats cached login payloads without is_superuser as unresolved', () => {
     expect(isUserRoleResolved({ roles: [] })).toBe(false)
   })
