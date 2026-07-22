@@ -5,15 +5,23 @@ import { createPinia, setActivePinia } from 'pinia'
 
 const chatMocks = vi.hoisted(() => ({
   getChatSessionsApi: vi.fn(),
+  getChatSessionApi: vi.fn(),
+  deleteChatSessionApi: vi.fn(),
   sendChatImageApi: vi.fn(),
   sendChatMessageApi: vi.fn(),
+  streamChatImageApi: vi.fn(),
+  streamChatMessageApi: vi.fn(),
 }))
 const profileMocks = vi.hoisted(() => ({ getProfileApi: vi.fn() }))
 
 vi.mock('@/api/chat', () => ({
   getChatSessionsApi: chatMocks.getChatSessionsApi,
+  getChatSessionApi: chatMocks.getChatSessionApi,
+  deleteChatSessionApi: chatMocks.deleteChatSessionApi,
   sendChatImageApi: chatMocks.sendChatImageApi,
   sendChatMessageApi: chatMocks.sendChatMessageApi,
+  streamChatImageApi: chatMocks.streamChatImageApi,
+  streamChatMessageApi: chatMocks.streamChatMessageApi,
 }))
 vi.mock('@/api/profile', () => ({ getProfileApi: profileMocks.getProfileApi }))
 
@@ -73,9 +81,10 @@ describe('ChatPage generation controls', () => {
   })
 
   it('aborts the active request and replaces the pending reply', async () => {
+    // 默认走流式路径：请求挂起直到被中断
     let requestSignal
-    chatMocks.sendChatMessageApi.mockImplementation((_payload, config) => {
-      requestSignal = config.signal
+    chatMocks.streamChatMessageApi.mockImplementation((_payload, { signal } = {}) => {
+      requestSignal = signal
       return new Promise((_resolve, reject) => {
         requestSignal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { code: 'ERR_CANCELED' })), { once: true })
       })
@@ -85,7 +94,7 @@ describe('ChatPage generation controls', () => {
     await wrapper.find('textarea').setValue('帮我安排训练后的晚餐')
     await wrapper.find('.send-button').trigger('click')
 
-    expect(chatMocks.sendChatMessageApi).toHaveBeenCalledOnce()
+    expect(chatMocks.streamChatMessageApi).toHaveBeenCalledOnce()
     expect(wrapper.find('.stop-button').exists()).toBe(true)
     expect(requestSignal.aborted).toBe(false)
 

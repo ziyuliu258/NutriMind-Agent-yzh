@@ -21,6 +21,9 @@ logs/*.log
 
 # Runtime images and model weights
 data/agent_uploads/
+data/avatars/
+runs/
+/yolo*.pt
 
 # Environment
 .env

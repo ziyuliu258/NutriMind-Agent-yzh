@@ -333,7 +333,8 @@ function payloadData(payload) { return payload?.data ?? payload }
 
 function setActiveView(view) {
   activeView.value = view
-  if (view === 'graph' && !graphLoaded.value) loadGraph()
+  // 每次切到图谱都重新拉取，及时反映上传/对话新抽取出的节点
+  if (view === 'graph') loadGraph()
 }
 
 function refreshCurrentView() {
@@ -389,8 +390,16 @@ async function upload() {
       ElMessage.success('预览模式：已模拟完成文档解析')
     } else {
       const data = payloadData(await uploadDocumentApi(selectedFile.value))
-      ElMessage.success(`上传成功，生成 ${data?.chunks_count ?? 0} 个知识片段`)
+      const chunks = data?.chunks_count ?? 0
+      const foods = data?.foods_count ?? 0
+      ElMessage.success(
+        foods > 0
+          ? `上传成功，生成 ${chunks} 个知识片段，识别 ${foods} 种食物`
+          : `上传成功，生成 ${chunks} 个知识片段`,
+      )
       await loadStats()
+      // 已抽取出食物实体时，若图谱已加载则刷新，使新连接立即可见
+      if (foods > 0 && graphLoaded.value) await loadGraph()
     }
     selectedFile.value = null
     uploadRef.value?.clearFiles()
