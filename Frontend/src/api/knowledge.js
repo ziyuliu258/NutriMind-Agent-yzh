@@ -17,3 +17,4 @@ export const askKnowledgeApi = (params, config = {}) => request.get('/knowledge/
 })
 export const deleteDocumentApi = (source) => request.delete('/knowledge/', { params: { source } })
 export const getKnowledgeStatsApi = () => request.get('/knowledge/stats')
+export const getKnowledgeGraphApi = (config = {}) => request.get('/knowledge/graph', config)

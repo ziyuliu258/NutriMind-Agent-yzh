@@ -35,6 +35,59 @@ export function normalizeKnowledgeStats(payload) {
   }
 }
 
+const graphNodeTypes = new Set(['food', 'category', 'nutrient'])
+
+function finiteNumber(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+function normalizeGraphNode(item = {}, index = 0) {
+  const type = graphNodeTypes.has(item.type) ? item.type : 'food'
+  return {
+    ...item,
+    id: String(item.id || `${type}-${index}`),
+    label: String(item.label || item.food_name_cn || item.name_en || '未命名节点'),
+    type,
+    group: graphNodeTypes.has(item.group) ? item.group : type,
+    name_en: typeof item.name_en === 'string' ? item.name_en : '',
+    category: typeof item.category === 'string' ? item.category : '',
+    unit: typeof item.unit === 'string' ? item.unit : '',
+    calories: finiteNumber(item.calories),
+    protein: finiteNumber(item.protein),
+    fat: finiteNumber(item.fat),
+    carbs: finiteNumber(item.carbs),
+    fiber: finiteNumber(item.fiber),
+  }
+}
+
+function normalizeGraphEdge(item = {}, index = 0) {
+  const source = String(item.source || '')
+  const target = String(item.target || '')
+  const value = finiteNumber(item.value)
+  return {
+    ...item,
+    id: String(item.id || `${source}-${target}-${index}`),
+    source,
+    target,
+    relation: item.relation === 'HAS_NUTRIENT' ? 'HAS_NUTRIENT' : 'BELONGS_TO',
+    value,
+  }
+}
+
+export function normalizeKnowledgeGraph(payload) {
+  const data = unwrapApiData(payload) || {}
+  const nodes = Array.isArray(data.nodes) ? data.nodes.map(normalizeGraphNode) : []
+  const nodeIds = new Set(nodes.map((node) => node.id))
+  const edges = Array.isArray(data.edges)
+    ? data.edges
+      .map(normalizeGraphEdge)
+      .filter((edge) => edge.source && edge.target && nodeIds.has(edge.source) && nodeIds.has(edge.target))
+    : []
+
+  return { nodes, edges }
+}
+
 function normalizeAnswerSource(item = {}, index = 0) {
   const score = item.score === null || item.score === undefined ? null : Number(item.score)
   return {

@@ -4,14 +4,24 @@
       <div>
         <span class="eyebrow"><BookOpenText :size="16" weight="bold" /> FUEL LIBRARY</span>
         <h1 class="page-title">把营养知识，<br><em>变成行动。</em></h1>
-        <p class="page-description">检索可信资料中的饮食建议，用它校准下一餐、下一次训练和你的减脂计划。</p>
+        <p class="page-description">{{ activeView === 'library' ? '检索可信资料中的饮食建议，用它校准下一餐、下一次训练和你的减脂计划。' : '从食物、分类与营养素的连接中，更直观地理解每一种选择。' }}</p>
       </div>
-      <button class="refresh-button" :disabled="statsLoading" aria-label="刷新知识库统计" @click="loadStats">
-        <ArrowsClockwise :size="18" :class="{ spinning: statsLoading }" aria-hidden="true" />
+      <button class="refresh-button" :disabled="currentViewLoading" :aria-label="activeView === 'library' ? '刷新知识库统计' : '刷新营养知识图谱'" @click="refreshCurrentView">
+        <ArrowsClockwise :size="18" :class="{ spinning: currentViewLoading }" aria-hidden="true" />
         刷新
       </button>
     </header>
 
+    <nav class="library-sections surface" aria-label="知识库视图">
+      <button type="button" :class="{ active: activeView === 'library' }" :aria-current="activeView === 'library' ? 'page' : undefined" @click="setActiveView('library')">
+        <BookOpenText :size="20" /><span><b>知识检索</b><small>问答、搜索与资料管理</small></span>
+      </button>
+      <button type="button" :class="{ active: activeView === 'graph' }" :aria-current="activeView === 'graph' ? 'page' : undefined" @click="setActiveView('graph')">
+        <GraphIcon :size="20" /><span><b>营养图谱</b><small>探索食物与营养关系</small></span>
+      </button>
+    </nav>
+
+    <template v-if="activeView === 'library'">
     <section class="search-command surface" aria-labelledby="search-title">
       <div class="command-index">01</div>
       <div class="command-content">
@@ -218,35 +228,50 @@
         </FuelButton>
       </aside>
     </section>
+    </template>
+
+    <NutritionKnowledgeGraph
+      v-else
+      :nodes="graph.nodes"
+      :edges="graph.edges"
+      :loading="graphLoading"
+      :error="graphError"
+      @retry="loadGraph"
+    />
   </div>
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   PhArrowsClockwise as ArrowsClockwise, PhBookOpenText as BookOpenText,
   PhCheckCircle as CheckCircle, PhDatabase as Database, PhFiles as Files,
   PhFileText as FileText, PhGlobeHemisphereWest as GlobeHemisphereWest,
-  PhLinkSimple as LinkSimple, PhMagnifyingGlass as MagnifyingGlass,
+  PhGraph as GraphIcon, PhLinkSimple as LinkSimple, PhMagnifyingGlass as MagnifyingGlass,
   PhShieldCheck as ShieldCheck, PhSparkle as Sparkle, PhStack as Stack,
   PhTrash as Trash, PhUploadSimple as UploadSimple, PhWarningCircle as WarningCircle,
 } from '@phosphor-icons/vue'
 import CountUp from '@/components/motion/CountUp.vue'
 import SpotlightCard from '@/components/motion/SpotlightCard.vue'
 import FuelButton from '@/components/ui/FuelButton.vue'
-import { askKnowledgeApi, deleteDocumentApi, getKnowledgeStatsApi, searchKnowledgeApi, uploadDocumentApi } from '@/api/knowledge'
+import NutritionKnowledgeGraph from '@/components/knowledge/NutritionKnowledgeGraph.vue'
+import { askKnowledgeApi, deleteDocumentApi, getKnowledgeGraphApi, getKnowledgeStatsApi, searchKnowledgeApi, uploadDocumentApi } from '@/api/knowledge'
 import { useUserStore } from '@/stores/user'
-import { normalizeKnowledgeAnswer, normalizeKnowledgeSearch, normalizeKnowledgeStats } from '@/utils/knowledgeData'
+import { normalizeKnowledgeAnswer, normalizeKnowledgeGraph, normalizeKnowledgeSearch, normalizeKnowledgeStats } from '@/utils/knowledgeData'
 import { renderMarkdown } from '@/utils/markdown'
 
 const accept = '.pdf,.md,.txt,.png,.jpg,.jpeg,.gif,.bmp,.webp'
 const quickQueries = ['减脂期怎么吃', '训练后补给', '膳食纤维摄入']
+const activeView = ref('library')
 const uploadRef = ref()
 const selectedFile = ref(null)
 const uploading = ref(false)
 const searching = ref(false)
 const statsLoading = ref(false)
+const graphLoading = ref(false)
+const graphLoaded = ref(false)
+const graphError = ref('')
 const query = ref('')
 const limit = ref(5)
 const mode = ref('ask')
@@ -258,7 +283,9 @@ const askError = ref('')
 const results = ref([])
 const hasSearched = ref(false)
 const stats = reactive({ total_documents: 0, total_chunks: 0 })
+const graph = reactive({ nodes: [], edges: [] })
 const userStore = useUserStore()
+const currentViewLoading = computed(() => activeView.value === 'graph' ? graphLoading.value : statsLoading.value)
 const demoResults = [
   { source: '中国居民膳食指南（演示）.pdf', score: 0.94, content: '成年人应保持食物多样，合理搭配谷薯类、蔬菜水果、动物性食物以及奶豆坚果类食物，并结合自身活动水平控制总能量摄入。' },
   { source: '运动营养基础（演示）.md', score: 0.88, content: '处于减脂阶段时，应优先保证蛋白质摄入和力量训练，并设置适度、可持续的热量缺口，避免过度节食影响训练表现。' },
@@ -273,8 +300,66 @@ const demoAnswer = {
   ],
   localResults: [], webResults: [], usedWebFallback: false, crossVerified: false,
 }
+const demoGraph = {
+  nodes: [
+    { id: 'cat_meat', label: '肉蛋类', type: 'category', group: 'category' },
+    { id: 'cat_fruit', label: '水果', type: 'category', group: 'category' },
+    { id: 'cat_grain', label: '谷物', type: 'category', group: 'category' },
+    { id: 'food_chicken', label: '鸡胸肉', name_en: 'Chicken breast', type: 'food', group: 'food', category: '肉蛋类', calories: 165, protein: 31, fat: 3.6, carbs: 0, fiber: 0 },
+    { id: 'food_egg', label: '鸡蛋', name_en: 'Egg', type: 'food', group: 'food', category: '肉蛋类', calories: 143, protein: 12.6, fat: 9.5, carbs: 0.7, fiber: 0 },
+    { id: 'food_apple', label: '苹果', name_en: 'Apple', type: 'food', group: 'food', category: '水果', calories: 52, protein: 0.3, fat: 0.2, carbs: 13.8, fiber: 2.4 },
+    { id: 'food_oats', label: '燕麦', name_en: 'Oats', type: 'food', group: 'food', category: '谷物', calories: 389, protein: 16.9, fat: 6.9, carbs: 66.3, fiber: 10.6 },
+    { id: 'nut_calories', label: '热量', type: 'nutrient', group: 'nutrient', unit: 'kcal' },
+    { id: 'nut_protein', label: '蛋白质', type: 'nutrient', group: 'nutrient', unit: 'g' },
+    { id: 'nut_fat', label: '脂肪', type: 'nutrient', group: 'nutrient', unit: 'g' },
+    { id: 'nut_carbs', label: '碳水化合物', type: 'nutrient', group: 'nutrient', unit: 'g' },
+    { id: 'nut_fiber', label: '膳食纤维', type: 'nutrient', group: 'nutrient', unit: 'g' },
+  ],
+  edges: [],
+}
+
+demoGraph.nodes.filter((node) => node.type === 'food').forEach((food) => {
+  const categoryId = food.category === '肉蛋类' ? 'cat_meat' : food.category === '水果' ? 'cat_fruit' : 'cat_grain'
+  demoGraph.edges.push({ source: food.id, target: categoryId, relation: 'BELONGS_TO' })
+  ;[
+    ['calories', 'nut_calories'], ['protein', 'nut_protein'], ['fat', 'nut_fat'],
+    ['carbs', 'nut_carbs'], ['fiber', 'nut_fiber'],
+  ].forEach(([field, target]) => {
+    if (food[field] > 0) demoGraph.edges.push({ source: food.id, target, relation: 'HAS_NUTRIENT', value: food[field] })
+  })
+})
 
 function payloadData(payload) { return payload?.data ?? payload }
+
+function setActiveView(view) {
+  activeView.value = view
+  if (view === 'graph' && !graphLoaded.value) loadGraph()
+}
+
+function refreshCurrentView() {
+  if (activeView.value === 'graph') loadGraph()
+  else loadStats()
+}
+
+async function loadGraph() {
+  if (graphLoading.value) return
+  graphLoading.value = true
+  graphError.value = ''
+  try {
+    const data = userStore.isDemo
+      ? normalizeKnowledgeGraph(demoGraph)
+      : normalizeKnowledgeGraph(await getKnowledgeGraphApi({ silent: true }))
+    graph.nodes = data.nodes
+    graph.edges = data.edges
+    graphLoaded.value = true
+  } catch {
+    graph.nodes = []
+    graph.edges = []
+    graphError.value = '当前无法取得图谱数据，请稍后重新加载。'
+  } finally {
+    graphLoading.value = false
+  }
+}
 
 async function loadStats() {
   if (userStore.isDemo) {
@@ -418,6 +503,13 @@ onMounted(loadStats)
 .refresh-button { min-height: 42px; padding: 0 14px; display: inline-flex; align-items: center; gap: 8px; color: var(--text-secondary); background: rgba(255,255,255,.035); border: 1px solid var(--border); border-radius: 10px; }
 .refresh-button:hover { color: var(--primary); border-color: rgba(159,226,75,.35); }
 .spinning { animation: spin .8s linear infinite; }
+.library-sections { padding: 5px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+.library-sections button { min-height: 68px; padding: 10px 16px; display: flex; align-items: center; gap: 11px; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 11px; text-align: left; transition: color 170ms var(--ease-out), background 170ms var(--ease-out), border-color 170ms var(--ease-out); }
+.library-sections button:hover { color: var(--text-secondary); background: rgba(255,255,255,.018); }
+.library-sections button.active { color: var(--primary); background: var(--primary-soft); border-color: rgba(159,226,75,.19); }
+.library-sections button > span { min-width: 0; display: grid; gap: 2px; }
+.library-sections b { color: currentColor; font-size: .8rem; }
+.library-sections small { color: var(--muted); font-size: .65rem; }
 .search-command { padding: 22px; display: grid; grid-template-columns: 58px 1fr; gap: 20px; }
 .command-index { color: var(--primary); font-family: "Barlow Condensed"; font-size: 2rem; font-weight: 600; }
 .command-index.small { font-size: 1.25rem; }
@@ -542,6 +634,7 @@ a.answer-source:hover { border-color: rgba(159,226,75,.3); transform: translateY
 }
 @media (max-width: 520px) {
   .hero { padding: 26px 20px; }
+  .library-sections { grid-template-columns: 1fr; }
   .command-heading { align-items: flex-start; }
   .result-limit { flex-direction: column; align-items: flex-end; gap: 4px; }
   .query-modes { width: 100%; }
@@ -558,7 +651,7 @@ a.answer-source:hover { border-color: rgba(159,226,75,.3); transform: translateY
   .answer-error button { grid-column: 1 / -1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .query-box, .query-modes button, .ask-options button, .result-item, .answer-source { transition: none; }
+  .library-sections button, .query-box, .query-modes button, .ask-options button, .result-item, .answer-source { transition: none; }
   .spinning, .result-skeleton i { animation: none; }
 }
 </style>
